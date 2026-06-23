@@ -63,6 +63,36 @@ const state = {
 					.querySelectorAll<HTMLElement>('.u-questionItem,[class*=questionBody]')
 					.item(index)
 					?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			},
+			moycp: (index: number) => {
+				// 慕享为单题逐题模式，点击答题卡对应题号切换到该题
+				// 答题卡 .select-item-list 下的 span 为 Vue 元素，需补充 MouseEvent 触发
+				const clickVue = (el: HTMLElement) => {
+					el.click();
+					el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+				};
+				const nav = document
+					.querySelectorAll<HTMLElement>('.select-item-list span')
+					.item(index);
+				if (nav) {
+					clickVue(nav);
+				} else {
+					// 兜底：逐题切换到目标题
+					const current = document.querySelector<HTMLElement>('.select-item-list span.current');
+					let currentIdx = current ? Array.from(current.parentElement!.children).indexOf(current) : 0;
+					const next = () => document.querySelector<HTMLElement>('.btn.next');
+					const interval = setInterval(() => {
+						if (currentIdx >= index) {
+							clearInterval(interval);
+							return;
+						}
+						const n = next();
+						if (n) {
+							clickVue(n);
+							currentIdx++;
+						}
+					}, 500);
+				}
 			}
 		}
 	},
@@ -158,18 +188,26 @@ export const CommonProject = Project.create({
 										className: 'base-style-active-form-control',
 										style: { backgroundColor: '#eef2f7', borderRadius: '2px', padding: '2px 8px' }
 									},
-									[
-										h('option', '默认'),
-										h(
-											'option',
-											{
-												title:
-													'大学生网课题库接口适配器: 将不同的题库整合为一个API接口。详细查看 https://github.com/DokiDoki1103/tikuAdapter'
-											},
-											'TikuAdapter'
-										)
-									]
-								)
+										[
+											h('option', '默认'),
+											h(
+												'option',
+												{
+													title:
+														'大学生网课题库接口适配器: 将不同的题库整合为一个API接口。详细查看 https://github.com/DokiDoki1103/tikuAdapter'
+												},
+												'TikuAdapter'
+											),
+											h(
+												'option',
+												{
+													title:
+														'接入 OpenAI 兼容协议的大模型题库（GPT/DeepSeek/Kimi/通义等中转站），只需填写 API 地址 + Key + 模型名'
+												},
+												'AI大模型'
+											)
+										]
+									)
 							);
 
 							const modal = $modal.prompt({
@@ -248,7 +286,8 @@ export const CommonProject = Project.create({
 
 													const value = textarea.value;
 
-													if (!value) {
+													// AI大模型解析器使用专用配置面板，不依赖 textarea 内容
+													if (!value && select.value !== 'AI大模型') {
 														$modal.alert({
 															content: h('div', '不能为空！')
 														});
@@ -314,15 +353,64 @@ export const CommonProject = Project.create({
 																},
 																handler: "return (res)=>res.answer.allAnswer.map(i=>([res.question,i.join('#')]))"
 															});
-														} else {
-															const contents = value
-																.split('###')
-																.map((i) => i.trim())
-																.filter(Boolean);
-															for (const content of contents) {
-																awsResult.push(...(await AnswerWrapperParser.from(content)));
+										} else if (select.value === 'AI大模型') {
+											// AI 大模型题库：弹出专用配置面板（带测试连接按钮）
+											// ⚠️ 支持多组 AI 配置（主+备用）：每次选择都追加一个新的 AI wrapper，
+											// 不再替换已有的 AI。多个 AI 会按数组顺序被 moycp answerer
+											// 顺序 fallback（第一个失败才试下一个）。
+											// ⚠️ awsResult 从空数组开始，必须先带入已有的所有 wrapper（aw），
+											// 否则添加 AI 会清空已配置的其他题库。
+											const existingAIs = aw.filter((x) => x.name === 'AI大模型题库');
+											// 保留已有配置（避免添加 AI 时丢失其他题库/已有 AI）
+											awsResult.push(...aw);
+											const lastAI = existingAIs[existingAIs.length - 1];
+											let initUrl = '';
+											let initKey = '';
+											let initModel = 'gpt-3.5-turbo';
+											if (lastAI) {
+												initUrl = lastAI.url || '';
+												initKey = (lastAI.headers?.Authorization || '').replace(/^Bearer\s+/i, '');
+												initModel = (lastAI.data as any)?.model || (lastAI.data as any)?._aiModel || 'gpt-3.5-turbo';
+											}
+
+											const formData = await showAIConfigPanel(initUrl, initKey, initModel);
+
+											if (!formData || !formData.url || !formData.key) {
+												return;
+											}
+
+											select.value = '默认';
+											// 自动补全地址路径：只填到 /v1 的也自动补全
+											let apiUrl = formData.url.replace(/\/$/, '');
+											if (!apiUrl.includes('/chat/completions')) {
+												if (apiUrl.includes('/v1')) {
+													apiUrl = apiUrl + '/chat/completions';
+												} else {
+													apiUrl = apiUrl + '/v1/chat/completions';
+												}
+											}
+											awsResult.push(
+												createAIAnswererWrapper({
+													url: apiUrl,
+													key: formData.key,
+													model: formData.model || 'gpt-3.5-turbo'
+												})
+											);
+											// 提示用户当前 AI 数量
+											$message.success({
+												content: `AI 题库已配置 ${existingAIs.length + 1} 个。答题时按顺序尝试，第一个不可用自动切换下一个。`,
+												duration: 8
+											});
+															} else {
+																const contents = value
+																	.split('###')
+																	.map((i) => i.trim())
+																	.filter(Boolean);
+																for (const content of contents) {
+																	awsResult.push(...(await AnswerWrapperParser.from(content)));
+																}
 															}
-														}
+
 
 														// 为空判断
 														if (awsResult.length === 0) {
@@ -656,6 +744,15 @@ export const CommonProject = Project.create({
 						 */
 						workOptions.answererWrappers = workOptions.answererWrappers.filter(
 							(aw) => this.cfg.disabledAnswererWrapperNames.find((daw) => daw === aw.name) === undefined
+						);
+
+						/**
+						 * AI 大模型题库特殊处理：
+						 * 存储里只有简单配置（url/key/model），这里用源码固定函数重建完整 wrapper，
+						 * 确保 handler 总是源码最新版（避免用户存储里的旧坏 handler）。
+						 */
+						workOptions.answererWrappers = workOptions.answererWrappers.map((aw) =>
+							aw.name === AI_WRAPPER_NAME ? buildAIWrapper(aw) : aw
 						);
 
 						return workOptions;
@@ -1852,3 +1949,349 @@ function createSearchResultAlertElement(result: SimplifyWorkResult) {
 
 	return h('div', { className: 'alert-info-wrapper' }, [info ?? h('div')]);
 }
+
+/**
+ * AI 大模型题库配置面板
+ *
+ * 专用配置界面：三个清晰输入框（地址/Key/模型名）+ 测试连接按钮。
+ * 测试按钮会发一条真实的 chat/completions 请求，验证地址、Key、模型是否可用。
+ *
+ * @returns 配置对象，用户取消返回 null
+ */
+function showAIConfigPanel(
+	initUrl: string,
+	initKey: string,
+	initModel: string
+): Promise<{ url: string; key: string; model: string } | null> {
+	return new Promise((resolve) => {
+		const urlInput = h('input', {
+			className: 'base-style-active-form-control',
+			style: { width: '100%', margin: '4px 0 6px', padding: '6px 10px', boxSizing: 'border-box' },
+			placeholder: 'https://api.deepseek.com/v1  或  https://api.openai.com/v1/chat/completions',
+			value: initUrl
+		}) as HTMLInputElement;
+		const keyInput = h('input', {
+			className: 'base-style-active-form-control',
+			style: { width: '100%', margin: '4px 0 6px', padding: '6px 10px', boxSizing: 'border-box' },
+			placeholder: 'sk-xxxxxxxx...',
+			value: initKey
+		}) as HTMLInputElement;
+		const modelInput = h('input', {
+			className: 'base-style-active-form-control',
+			style: { width: '100%', margin: '4px 0 6px', padding: '6px 10px', boxSizing: 'border-box' },
+			placeholder: 'gpt-4o-mini / deepseek-chat / qwen-plus ...',
+			value: initModel
+		}) as HTMLInputElement;
+
+		// 测试结果展示区
+		const statusEl = h('div', {
+			style: { margin: '8px 0', minHeight: '24px', fontSize: '13px', padding: '6px 10px', borderRadius: '4px' }
+		}) as HTMLDivElement;
+
+		// 测试连接按钮
+		let testing = false;
+		const testBtn = h(
+			'button',
+			{
+				className: 'base-style-button',
+				onclick: async () => {
+					if (testing) return;
+					const url = urlInput.value.trim();
+					const key = keyInput.value.trim();
+					const model = modelInput.value.trim() || 'gpt-3.5-turbo';
+					if (!url || !key) {
+						statusEl.style.background = '#fff3cd';
+						statusEl.style.color = '#856404';
+						statusEl.textContent = '⚠️ 请先填写 API 地址和 Key';
+						return;
+					}
+					testing = true;
+					testBtn.textContent = '测试中...';
+					testBtn.setAttribute('disabled', 'true');
+					statusEl.style.background = '#e7f5ff';
+					statusEl.style.color = '#1971c2';
+					statusEl.textContent = '🔄 正在请求，请稍候（首次可能较慢）...';
+
+					// 自动补全地址
+					let apiUrl = url.replace(/\/$/, '');
+					if (!apiUrl.includes('/chat/completions')) {
+						apiUrl = apiUrl.includes('/v1') ? apiUrl + '/chat/completions' : apiUrl + '/v1/chat/completions';
+					}
+
+					const startTime = Date.now();
+					try {
+						const res: any = await Promise.race([
+							request(apiUrl, {
+								method: 'post',
+								type: 'GM_xmlhttpRequest',
+								responseType: 'json',
+								headers: {
+									'Content-Type': 'application/json',
+									Authorization: 'Bearer ' + key
+								},
+								data: {
+									model,
+									temperature: 0.1,
+									max_tokens: 10,
+									messages: [
+										{ role: 'system', content: '只回复"OK"' },
+										{ role: 'user', content: '回复OK' }
+									]
+								}
+							}),
+							$.sleep(30000).then(() => {
+								throw new Error('请求超时（30秒），请检查地址是否正确或网络是否通畅');
+							})
+						]);
+						const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+						const reply = res?.choices?.[0]?.message?.content;
+						if (reply !== undefined) {
+							statusEl.style.background = '#d3f9d8';
+							statusEl.style.color = '#2b8a3e';
+							statusEl.textContent = `✅ 连接成功！耗时 ${elapsed}s，模型回复："${String(reply).trim().slice(0, 30)}"`;
+						} else {
+							statusEl.style.background = '#fff3cd';
+							statusEl.style.color = '#856404';
+							statusEl.textContent = `⚠️ 连接成功但响应格式异常：${JSON.stringify(res).slice(0, 80)}`;
+						}
+					} catch (e: any) {
+						const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+						statusEl.style.background = '#ffe3e3';
+						statusEl.style.color = '#c92a2a';
+						let msg = e?.message || String(e);
+						// 常见错误友好提示
+						if (/401|Unauthorized|invalid.*api.*key/i.test(msg)) {
+							msg = 'API Key 无效或已过期（401），请检查 Key 是否正确';
+						} else if (/404|not found/i.test(msg)) {
+							msg = '地址或模型名不存在（404），请检查地址路径和模型名拼写';
+						} else if (/model/i.test(msg)) {
+							msg = '模型名错误：' + msg + '（请确认服务商支持的模型名）';
+						}
+						statusEl.textContent = `❌ 连接失败（${elapsed}s）：${msg}`;
+					} finally {
+						testing = false;
+						testBtn.textContent = '🔌 测试连接';
+						testBtn.removeAttribute('disabled');
+					}
+				}
+			},
+			'🔌 测试连接'
+		) as HTMLButtonElement;
+
+		// 移除可能的旧弹窗
+		document.querySelectorAll('.ocs-ai-config-modal-mask').forEach((el) => el.remove());
+
+		const mask = h(
+			'div',
+			{
+				className: 'ocs-ai-config-modal-mask',
+				style: {
+					position: 'fixed',
+					inset: '0',
+					background: 'rgba(0,0,0,0.5)',
+					zIndex: '2147483647',
+					display: 'flex',
+					alignItems: 'center',
+					justifyContent: 'center'
+				}
+			},
+			[
+				h(
+					'div',
+					{
+						style: {
+							background: '#fff',
+							borderRadius: '8px',
+							width: '520px',
+							maxWidth: '90vw',
+							maxHeight: '90vh',
+							overflow: 'auto',
+							padding: '20px 24px',
+							boxShadow: '0 8px 32px rgba(0,0,0,0.2)'
+						}
+					},
+					[
+						h('div', { style: { fontSize: '18px', fontWeight: 'bold', marginBottom: '4px' } }, '🤖 AI 大模型题库配置'),
+						h(
+							'div',
+							{ style: { fontSize: '13px', color: '#666', marginBottom: '14px' } },
+							'接入 OpenAI 兼容协议的中转站（GPT/DeepSeek/Kimi/通义/智谱等）。建议先点「测试连接」验证配置。'
+						),
+						h('label', { style: { display: 'block', fontWeight: 'bold', fontSize: '13px' } }, '① API 请求地址'),
+						urlInput,
+						h('div', { className: 'secondary', style: { fontSize: '12px', marginBottom: '8px' } }, '填到 /v1 即可，会自动补全。示例：https://api.deepseek.com/v1'),
+						h('label', { style: { display: 'block', fontWeight: 'bold', fontSize: '13px' } }, '② API Key'),
+						keyInput,
+						h('div', { className: 'secondary', style: { fontSize: '12px', marginBottom: '8px' } }, '以 sk- 开头的密钥，在模型服务商控制台获取'),
+						h('label', { style: { display: 'block', fontWeight: 'bold', fontSize: '13px' } }, '③ 模型名'),
+						modelInput,
+						h(
+							'div',
+							{ className: 'secondary', style: { fontSize: '12px', marginBottom: '8px' } },
+							'常见：gpt-4o-mini / gpt-3.5-turbo / deepseek-chat / qwen-plus / glm-4-flash'
+						),
+						statusEl,
+						h(
+							'div',
+							{ style: { marginTop: '12px', display: 'flex', gap: '8px', justifyContent: 'space-between' } },
+							[
+								testBtn,
+								h('div', { style: { display: 'flex', gap: '8px' } }, [
+									h(
+										'button',
+										{
+											className: 'base-style-button',
+											onclick: () => {
+												mask.remove();
+												resolve(null);
+											}
+										},
+										'取消'
+									),
+									h(
+										'button',
+										{
+											className: 'base-style-button',
+											style: { background: '#1971c2', color: '#fff' },
+											onclick: () => {
+												const url = urlInput.value.trim();
+												const key = keyInput.value.trim();
+												const model = modelInput.value.trim() || 'gpt-3.5-turbo';
+												if (!url || !key) {
+													statusEl.style.background = '#fff3cd';
+													statusEl.style.color = '#856404';
+													statusEl.textContent = '⚠️ 地址和 Key 不能为空';
+													return;
+												}
+												mask.remove();
+												resolve({ url, key, model });
+											}
+										},
+										'💾 保存配置'
+									)
+								])
+							]
+						)
+					]
+				)
+			]
+		) as HTMLDivElement;
+		document.body.appendChild(mask);
+	});
+}
+
+/**
+ * 创建 AI 大模型题库的 AnswererWrapper（OpenAI 兼容协议）
+ *
+ * ⚠️ 重要：这里只存储简单配置（url/key/model），handler 留占位。
+ *    真正的 handler 逻辑由 buildAIWrapper 运行时用源码固定函数生成，
+ *    避免 handler 字符串序列化进用户存储后无法随源码更新。
+ *
+ * @param opts.url      API 请求地址（需包含 /v1/chat/completions）
+ * @param opts.key      API Key（sk-xxx）
+ * @param opts.model    模型名（如 gpt-4o-mini / deepseek-chat）
+ */
+function createAIAnswererWrapper(opts: { url: string; key: string; model: string }): AnswererWrapper {
+	return {
+		name: 'AI大模型题库',
+		url: opts.url,
+		homepage: 'https://platform.openai.com/docs/api-reference',
+		method: 'post',
+		type: 'GM_xmlhttpRequest',
+		contentType: 'json',
+		headers: {},
+		// 用 data 存储配置参数，handler 占位（运行时由 buildAIWrapper 重建）
+		data: { _aiKey: opts.key, _aiModel: opts.model },
+		handler: 'return undefined'
+	};
+}
+
+/** AI 题库固定标识：用于在 getWorkOptions 出口识别并重建 AI wrapper */
+const AI_WRAPPER_NAME = 'AI大模型题库';
+
+/**
+ * 运行时重建 AI wrapper（在 getWorkOptions 出口调用）
+ *
+ * 从简单配置（url + data._aiKey + data._aiModel）生成完整的 OpenAI 兼容 wrapper，
+ * handler 用源码里经过验证的固定函数。这样即使用户存储里是旧版坏 handler，
+ * 出口处也会用正确的源码覆盖，彻底杜绝 handler 字符串注入问题。
+ *
+ * 兼容旧版配置：旧版把 key 存在 headers.Authorization，model 存在 data.model
+ */
+function buildAIWrapper(stored: AnswererWrapper): AnswererWrapper {
+	// 兼容新旧两种存储格式提取 key 和 model
+	const key =
+		stored.data?._aiKey ||
+		(stored.headers?.Authorization || '').replace(/^Bearer\s+/i, '') ||
+		'';
+	const model = stored.data?._aiModel || stored.data?.model || 'gpt-3.5-turbo';
+	return {
+		name: AI_WRAPPER_NAME,
+		url: stored.url,
+		homepage: 'https://platform.openai.com/docs/api-reference',
+		method: 'post',
+		type: 'GM_xmlhttpRequest',
+		contentType: 'json',
+		headers: {
+			'Content-Type': 'application/json',
+			Authorization: 'Bearer ' + key
+		},
+		data: {
+			model,
+			temperature: 0.1,
+			messages: {
+				handler: aiMessagesHandlerSource
+			}
+		},
+		handler: aiResponseHandlerSource
+	};
+}
+
+/**
+ * AI messages handler 源码字符串（构造 OpenAI 请求的 prompt）
+ *
+ * ⚠️ 严格规则（避免重蹈转义覆辙）：
+ * - 禁止使用 // 单行注释（压缩成一行后会吞掉后续代码）
+ * - 禁止使用反引号模板字符串
+ * - 禁止直接写 \n （多层转义会出错），换行用 String.fromCharCode(10) 动态生成
+ * - 只用双引号字符串 + 字符串拼接
+ */
+const aiMessagesHandlerSource =
+	'return (env) => {' +
+	'  var NL = String.fromCharCode(10);' +
+	'  var type = env.type;' +
+	'  var title = env.title || "";' +
+	'  var options = (env.options || "").split(NL).filter(Boolean);' +
+	'  var sys = { role: "system", content: "你是一个答题助手。请根据题目和选项直接给出答案，不要做任何解释，不要加标点。" };' +
+	'  var user = "";' +
+	'  if (type === "single") {' +
+	'    user = "以下是一道单选题，请选出唯一正确选项，只回复选项字母（如B），不要解释。" + NL + title + NL + options.join(NL);' +
+	'  } else if (type === "multiple") {' +
+	'    user = "以下是一道多选题，请选出所有正确选项，只回复选项字母连写（如AC），不要加任何分隔符或标点，不要解释。" + NL + title + NL + options.join(NL);' +
+	'  } else if (type === "judgement") {' +
+	'    user = "以下是一道判断题，请判断对错，只回复正确或错误，不要解释。" + NL + title;' +
+	'  } else if (type === "completion") {' +
+	'    user = "以下是一道填空题，请给出填空答案，只回复答案内容，不要解释。" + NL + title;' +
+	'  } else {' +
+	'    user = "请回答以下问题，只回复答案，不要解释。" + NL + title + NL + options.join(NL);' +
+	'  }' +
+	'  return [sys, { role: "user", content: user }];' +
+	'}';
+
+/**
+ * AI 响应解析 handler 源码字符串（解析 OpenAI 响应并清洗答案）
+ *
+ * 同样遵守：无 // 注释、无反引号、只用单引号/双引号拼接
+ */
+const aiResponseHandlerSource =
+	'return (res) => {' +
+	'  if (!res || !res.choices || !res.choices[0]) { return undefined; }' +
+	'  var raw = (res.choices[0].message.content || "").trim();' +
+	'  var answer = raw;' +
+	'  if (/^(正确|对|true|T|是)$/i.test(raw)) {' +
+	'    answer = "正确";' +
+	'  } else if (/^(错误|错|false|F|否)$/i.test(raw)) {' +
+	'    answer = "错误";' +
+	'  }' +
+	'  return ["AI生成答案", answer, { ai: true, raw: raw }];' +
+	'}';
