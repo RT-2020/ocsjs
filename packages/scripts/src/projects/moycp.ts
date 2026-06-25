@@ -309,14 +309,16 @@ export const MoycpProject = Project.create({
 						// 防死循环：记录已尝试过且状态未变化的未完成小节（如题库无答案，补闯关后星级不变）
 						const triedKeys = new Set<string>();
 						//
-						// ⚠️ videoFirst（视频优先）两阶段模式下，course 脚本【故意不感知阶段】：
-						//   始终按「星级未达标(passMode)」找未完成小节进入。阶段切换完全由 study 脚本在
-						//   视频页读 sidebar 真实状态懒判定（详见 study main 的 videoFirst 分流）。
-						//   这样恢复天然正确：重进目录时 course 照常按星级找小节，进视频页后 study 按
+						// ⚠️ videoFirst（视频优先）两阶段模式下，course 脚本【仅感知 videoFirst 用于选入口】：
+						//   Phase1/Phase2 的阶段切换仍由 study 脚本在视频页读 sidebar 真实状态懒判定，
+						//   course 不存持久化 phase 标志。course 读 videoFirst 只为一件事：A 类小节在
+						//   videoFirst=true 时点 chuangguan「闯关」直进 exam（而非点 study「课件」进视频页），
+						//   配合 study Phase1 全 finish 后回目录，实现"闯关入口统一从目录页进"。
+						//   恢复天然正确：重进目录时 course 照常按星级找小节；进视频页后 study 按
 						//   sidebar 决定走 Phase1（连续播放）还是直接闯关（Phase2/恢复），零持久化标志。
 						//   防死循环：triedKeys 已覆盖「course 反复进同一 A 类小节」——补闯关后星级不变
 						//   的小节 key 不变会被跳过；若视频完成后目录进度变化导致 key 变，study 进视频页
-						//   会发现 sidebar 全 finish 直接闯关（Phase2），自纠不空转。
+						//   会发现 sidebar 全 finish 直接回目录（Phase2），自纠不空转。
 
 						while (canRun() && safetyCount < MAX_ITERATIONS) {
 							safetyCount++;
@@ -357,24 +359,36 @@ export const MoycpProject = Project.create({
 
 							$msg_and_log('info', `进入小节学习：${sectionName}`);
 							// 按章节类型选择正确入口按钮（MCP 实测确认，2026-06）：
-							//   A 类（有视频）：点 study「课件」→ 看视频 → 视频页 study 脚本接管
-							//   B 类（纯闯关/阶段作业）：点 chuangguan「测试」→ 进 exam 页 → work 脚本答题拿满星
+							//   A 类（有视频）：
+							//     - videoFirst=false（现状）：点 study「课件」→ 看视频 → 视频页 study 接管
+							//     - videoFirst=true（两阶段）：视频已在 Phase1 全部看完，A 类也从目录页
+							//       点 chuangguan「闯关」直接进 exam（不再从视频页点「去闯关」入口）
+							//   B 类（纯闯关/阶段作业/习题解析）：点 chuangguan「测试」→ 进 exam → work 答题拿满星
 							//     ⚠️ B 类绝不能点 study「练习」（只给 2 星、会重复，无法满星）
+							//
+							// 入口判断用 DOM 元素（div.chuangguan）而非按钮文字：A 类文字是「闯关」、
+							// B 类是「测试」，但同一选择器、点击行为都是进 exam 页（MCP 实测确认）。
 							const dd = findSectionDd(unfinishedBtn);
 							const sectionType = getSectionType(dd);
+							// videoFirst 两阶段模式：course 配置读取（详见 study main 的 videoFirst 分流）
+							const videoFirst = !!MoycpProject.scripts.course.cfg.videoFirst;
 							let entryBtn: HTMLElement = unfinishedBtn;
-							if (sectionType === 'B') {
-								// B 类：找同 dd 内的「测试/闯关」按钮（div.chuangguan）
+							// 需要从目录页直接进 exam 的场景：B 类始终；A 类仅 videoFirst=true（视频已看完）
+							const enterViaChuangguan = sectionType === 'B' || (sectionType === 'A' && videoFirst);
+							if (enterViaChuangguan) {
+								// 找同 dd 内的「闯关/测试」按钮（div.chuangguan）
 								const cgBtn = dd?.querySelector<HTMLElement>('div.chuangguan');
 								if (cgBtn) {
 									entryBtn = cgBtn;
-									$dbg(`流程: B 类小节「${sectionName}」点「测试」进 exam 页（点练习只给 2 星）`);
+									$dbg(
+										`流程: ${sectionType} 类小节「${sectionName}」点 chuangguan「${cgBtn.textContent?.trim()}」进 exam 页${sectionType === 'A' ? '（videoFirst 两阶段，视频已看完）' : ''}`
+									);
 								} else {
-									$dbg(`流程: B 类小节「${sectionName}」未找到 chuangguan 按钮，回退点 study`);
+									$dbg(`流程: ${sectionType} 类小节「${sectionName}」未找到 chuangguan 按钮，回退点 study`);
 								}
 							}
-							$dbg(`流程: 进入小节学习「${sectionName}」（类型=${sectionType}，第 ${safetyCount}/${MAX_ITERATIONS} 次迭代）`);
-							// 点击入口按钮 → A 类进 /courseware2（study 接管）；B 类进 /study?type=exam（work 接管）
+							$dbg(`流程: 进入小节学习「${sectionName}」（类型=${sectionType}，videoFirst=${videoFirst}，第 ${safetyCount}/${MAX_ITERATIONS} 次迭代）`);
+							// 点击入口按钮 → study「课件」进 /courseware2（study 接管）；chuangguan 进 /study?type=exam（work 接管）
 							entryBtn.click();
 							entryBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 
@@ -663,7 +677,8 @@ export const MoycpProject = Project.create({
 					 *     sidebar 还有未 finish 项 → Phase1：点第一个「未完成且非当前」的 dd，校验导航成功
 					 *       （.current 切到 target）后【自重入 study.main】播下一子视频（⚠️ sidebar 跳转
 					 *       URL 不变，dispatcher 不会重入，必须自重入）；连续点同一 dd 无变化 3 次则跳过
-					 *     sidebar 全 finish → 走下方「点去闯关」（Phase2 / 重进恢复场景，不重看视频）
+					 *     sidebar 全 finish → Phase1 完成：history.back 回目录，交还 course 脚本
+					 *       由目录页 chuangguan 按钮进 exam（不再从视频页点「去闯关」，入口统一收敛到目录页）
 					 */
 					const videoFirst = !!MoycpProject.scripts.course.cfg.videoFirst;
 					if (videoFirst && canRun()) {
@@ -741,28 +756,34 @@ export const MoycpProject = Project.create({
 								job_id: state.current_job_id
 							});
 					}
-					// sidebar 全 finish：Phase1 已完成（或重进恢复场景），落到下方「点去闯关」逻辑
-					$dbg('videoFirst: sidebar 全部视频已完成，进入闯关（Phase2/恢复）');
-					}
+					// sidebar 全 finish：Phase1（全部视频）已完成。
+					// videoFirst 两阶段下，闯关入口统一从目录页进（course 脚本点 chuangguan），
+					// 这里 history.back 回目录页交还 course 接管，不再从视频页点「去闯关」。
+					$dbg('videoFirst: 全部视频已完成，回目录页交还 course 脚本进闯关（Phase2）');
+					$msg_and_log('info', '视频优先：全部视频学习完成，返回目录页进入闯关阶段');
+					await $.sleep(1500);
+					history.back();
+					return;
+				}
 
-					// 视频播完，尝试自动点击「去闯关」进入答题页
-						// 慕享会先弹确认框「准备好去闯关了吗？」需自动确认
-						//
-						// ⚠️ 历史问题：确认按钮用 textContent === '确定' 过严（可能是"确 定"/带图标/含空格），
-						// 且 Vue 可能拦截 .click() 导致 URL 没真的变成 type=exam，dispatcher 自然不触发 work 脚本。
-						// 修复：放宽「确定」匹配 + 点击后校验 URL 变化 + 失败重试一次 + 仍失败明确报错。
+				// 非 videoFirst 模式（现状）：视频播完后从视频页点「去闯关」进入答题页
+				// 慕享会先弹确认框「准备好去闯关了吗？」需自动确认
+				//
+				// ⚠️ 历史问题：确认按钮用 textContent === '确定' 过严（可能是"确 定"/带图标/含空格），
+				// 且 Vue 可能拦截 .click() 导致 URL 没真的变成 type=exam，dispatcher 自然不触发 work 脚本。
+				// 修复：放宽「确定」匹配 + 点击后校验 URL 变化 + 失败重试一次 + 仍失败明确报错。
 
-						/** 找「去闯关」按钮
-						 *
-						 * ⚠️ 慕享用 Element Plus，按钮文字包在 <span> 里：
-						 *    <button><span>去闯关</span></button>
-						 * 旧代码用 textContent==='去闯关' && children.length===0，匹配到的是内部
-						 * <span>，对 span.click() 无法触发 Vue 在 <button> 上的事件 → 点击无效
-						 * → URL 不变 → study 走 history.back → course 死循环（"未知小节"）。
-						 *
-						 * 修复：优先匹配 <button>/<a> 等可点击元素（即便有子元素），
-						 *      找不到再退回到叶子节点（兼容非 Element-UI 的纯文本元素）。
-						 */
+				/** 找「去闯关」按钮
+				 *
+				 * ⚠️ 慕享用 Element Plus，按钮文字包在 <span> 里：
+				 *    <button><span>去闯关</span></button>
+				 * 旧代码用 textContent==='去闯关' && children.length===0，匹配到的是内部
+				 * <span>，对 span.click() 无法触发 Vue 在 <button> 上的事件 → 点击无效
+				 * → URL 不变 → study 走 history.back → course 死循环（"未知小节"）。
+				 *
+				 * 修复：优先匹配 <button>/<a> 等可点击元素（即便有子元素），
+				 *      找不到再退回到叶子节点（兼容非 Element-UI 的纯文本元素）。
+				 */
 						const findGoExamBtn = (): HTMLElement | undefined => {
 							// 1. 优先：可点击容器（button/a/带 role）其文字含"去闯关"且较短
 							const clickable = Array.from(
