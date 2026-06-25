@@ -3,6 +3,7 @@ import { defineConfig } from 'vite';
 import banner from 'vite-plugin-banner';
 import { author, description, homepage, license, name } from '../../package.json';
 import dotenv from 'dotenv';
+import path from 'path';
 
 const bannerContent = `
 /*!
@@ -13,7 +14,8 @@ const bannerContent = `
  */
 `;
 
-dotenv.config();
+// 从项目根目录读取 .env（vite 在 packages/scripts 下运行，dotenv 默认只读 cwd 的 .env，读不到根目录的）
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 // https://vitejs.dev/config/
 export default defineConfig({

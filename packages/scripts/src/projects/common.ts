@@ -105,8 +105,13 @@ const state = {
 
 /**
  * 题库缓存类型
+ *
+ * type（题型）为可选维度：
+ * - 同一题干在不同题型下答案可能不同（如"判断题版"与"单选题版"），按 type 区分避免冲突。
+ * - 向后兼容：旧缓存无 type，匹配/去重时 type 为 undefined 时退化为仅按 title 处理，
+ *   未传 type 的课程（cx/icourse/icve/zhs/...）行为不变。
  */
-type QuestionCache = { title: string; answer: string; from: string; homepage: string; ai?: boolean };
+type QuestionCache = { title: string; answer: string; from: string; homepage: string; ai?: boolean; type?: string };
 
 export const CommonProject = Project.create({
 	name: '通用',
@@ -1482,16 +1487,30 @@ export const CommonProject = Project.create({
 			},
 			methods() {
 				return {
-					/**
-					 * 添加题库缓存
-					 */
+				/**
+				 * 添加题库缓存
+				 *
+				 * 去重/覆盖语义：
+				 * - 同 title + 同 type（type 缺失时仅按 title）视为同一题，覆盖为最新答案。
+				 *   原因：闯关结算页每次记录的都是"本次的正确答案"，旧记录（尤其选项字母已失效的）
+				 *   应被替换，避免重答时命中过时答案。
+				 * - type 参与判定：同一题干在判断题/单选题等不同题型下答案不同时分别保留。
+				 * - 向后兼容：旧缓存/未传 type 的课程（type 为 undefined），退化为仅按 title 去重，
+				 *   行为与改动前一致。
+				 */
 					addQuestionCache: async (...questionCacheItems: QuestionCache[]) => {
 						const questionCaches: QuestionCache[] = this.cfg.localQuestionCaches;
 						for (const item of questionCacheItems) {
-							// 去重
-							if (questionCaches.find((c) => c.title === item.title && c.answer === item.answer) === undefined) {
-								questionCaches.unshift(item);
+							// 同题同型覆盖：移除所有命中项，再 unshift 新的（保证只保留最新）
+							for (let i = questionCaches.length - 1; i >= 0; i--) {
+								const c = questionCaches[i];
+								const sameTitle = c.title === item.title;
+								const sameType = (c.type || undefined) === (item.type || undefined);
+								if (sameTitle && sameType) {
+									questionCaches.splice(i, 1);
+								}
 							}
+							questionCaches.unshift(item);
 						}
 
 						// 限制数量
@@ -1523,10 +1542,13 @@ export const CommonProject = Project.create({
 					 * 将题库缓存作为题库并进行题目搜索
 					 * @param title 题目
 					 * @param whenSearchEmpty 当搜索结果为空，或者题库缓存功能被关闭时执行的函数
+					 * @param type 题型（可选）。传入时按 title+type 精确匹配，避免同一题干在不同题型下答案冲突；
+					 *             不传时退化为仅按 title 匹配（向后兼容，cx/icourse/icve/zhs 等行为不变）。
 					 */
 					searchAnswerInCaches: async (
 						title: string,
-						whenSearchEmpty: () => SearchInformation[] | Promise<SearchInformation[]>
+						whenSearchEmpty: () => SearchInformation[] | Promise<SearchInformation[]>,
+						type?: string
 					): Promise<SearchInformation[]> => {
 						if (CommonProject.scripts.settings.cfg.enableQuestionCaches === false) {
 							return await whenSearchEmpty();
@@ -1535,7 +1557,10 @@ export const CommonProject = Project.create({
 						let results: SearchInformation[] = [];
 						const caches = this.cfg.localQuestionCaches;
 						for (const cache of caches) {
-							if (cache.title.trim() === title.trim()) {
+							const titleMatch = cache.title.trim() === title.trim();
+							// type 参与匹配：传了 type 时必须一致；没传 type 时仅按 title（向后兼容）
+							const typeMatch = type === undefined || (cache.type || undefined) === (type || undefined);
+							if (titleMatch && typeMatch) {
 								results.push({
 									name: cache.from,
 									homepage: cache.homepage,

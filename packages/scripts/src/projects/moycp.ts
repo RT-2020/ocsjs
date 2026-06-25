@@ -1,46 +1,15 @@
-import { $, OCSWorker, defaultAnswerWrapperHandler, SimplifyWorkResult } from '@ocsjs/core';
-import { $message, Project, Script, $ui, $store } from 'easy-us';
-import { CommonWorkOptions, playMedia } from '../utils';
+import { $, defaultAnswerWrapperHandler } from '@ocsjs/core';
+import { Project, Script, $ui } from 'easy-us';
+import { playMedia } from '../utils';
 import { CommonProject } from './common';
 import { commonWork, optimizationElementWithImage, removeRedundantWords, simplifyWorkResult } from '../utils/work';
-import { $console, BackgroundProject } from './background';
+import { BackgroundProject, $console } from './background';
 import { waitForMedia, waitFor, waitForElement } from '../utils/study';
 import { playbackRate, volume } from '../utils/configs';
-
-const $msg_and_log = (type: 'info' | 'warn' | 'error', msg: string) => {
-	$message[type](msg);
-	$console[type](msg);
-};
-
-/**
- * 模拟人工操作的随机延迟，降低被慕享反作弊检测的风险。
- *
- * @param minMs 最小延迟（毫秒）
- * @param maxMs 最大延迟（毫秒）
- * @returns Promise，在 [minMs, maxMs] 区间内的随机时间后 resolve
- */
-const humanSleep = (minMs = 150, maxMs = 350) =>
-	$.sleep(minMs + Math.floor(Math.random() * (maxMs - minMs + 1)));
-
-const state = {
-	currentMedia: undefined as HTMLMediaElement | undefined,
-	currentUrl: '',
-	currentRunningScriptName: '',
-	current_job_id: '',
-	// work.main 防重入锁：多条触发路径（oncomplete/dispatcher/study 主动）互斥
-	workRunning: false,
-	// 闯关失败自动重闯计数（按 itemId 区分会话内同一小节的重闯次数）
-	examRetryCount: {} as Record<string, number>
-};
-
-/** 获取当前页面的路由标识（pathname，用于匹配 runAtUrl） */
-const getCurrentPath = () => location.pathname;
-
-/** 判断当前 URL 是否包含任一关键词（用于脚本匹配） */
-const urlMatches = (keywords: string[]) => {
-	const full = location.pathname + location.search;
-	return keywords.some((k) => full.includes(k));
-};
+// 共享工具与状态（从 moycp-shared 导入，避免重复定义）
+import { $msg_and_log, $dbg, humanSleep, state, getCurrentPath, urlMatches, videoDoneCache } from './moycp-shared';
+// 答题工作器（从 moycp-work 导入，纯函数，不反向依赖本文件）
+import { workAndExam, waitForQuestion } from './moycp-work';
 
 /**
  * 慕享 (moycp.com) 网课平台适配
@@ -125,13 +94,21 @@ export const MoycpProject = Project.create({
 		/**
 		 * 课程目录/今日任务脚本
 		 *
-		 * 遍历小节，逐个点"课件"进入视频页（由 study 脚本接管）。
-		 * 视频看完+答题完成后会 history.back 回到这里，dispatcher 重入本脚本继续下一节。
+		 * 遍历小节，逐个点入口按钮进入学习/闯关页（由 study/work 脚本接管）。
+		 * 处理完后导航回目录页，dispatcher 重入本脚本继续下一节。
 		 *
-		 * 目录页选择器（MCP 实测确认）：
-		 * - 小节容器：.content-section（含课件按钮 div.study、进度 .alreadyStudyProgress i）
-		 * - 课件按钮：div.study
-		 * - 进度文字：.alreadyStudyProgress i（文本如 "100%"/"66%"）
+		 * 目录页 DOM 结构（MCP 实测确认，2026-06）：
+		 * - 小节容器：dd.catalog-detail-dd（每个小节一个 dd）
+		 * - 入口按钮区：.study-buttons 下有两个按钮
+		 *     - div.study         → A 类章节显示「课件」（进视频页），B 类章节显示「练习」（直接进闯关）
+		 *     - div.chuangguan    → A 类章节「闯关」，B 类章节「测试」（两类章节都有此按钮）
+		 * - 视频进度：.alreadyStudyProgress i（文本如 "100%"/"26%"，仅 A 类章节有）
+		 * - 闯关星级：.starLevel + span.star[×3] > img
+		 *     亮星 img src 含 "Uew6vjOR0lU"，暗星 img src 含 "L+A65AUzCw2U"（仅靠 src 区分，无 class 差异）
+		 *
+		 * 章节分两类，完成定义不同：
+		 * - A 类（有视频进度容器）：完成 = 视频进度 100% 且 星级满
+		 * - B 类（无视频进度容器，纯闯关如「习题解析」）：完成 = 星级满
 		 */
 		course: new Script({
 			name: '📚 课程目录脚本',
@@ -141,65 +118,222 @@ export const MoycpProject = Project.create({
 				['今日任务', 'moycp.com/courseDetail/dailyTask']
 			],
 			configs: {
-				runAtUrl: { defaultValue: ['/courseDetail/catalog', '/courseDetail/dailyTask'] }
+				runAtUrl: { defaultValue: ['/courseDetail/catalog', '/courseDetail/dailyTask'] },
+				/**
+				 * 闯关完成标准开关（MCP 实测 + 用户确认，2026-06）。
+				 *
+				 * 目录页章节完成判定的星级门槛：
+				 *   false（默认，现状）= 满星才算完成（litCount === starTotal）
+				 *   true               = 通过即可（litCount >= 2，慕享 2 星即"任务通过"）
+				 *
+				 * 默认 false：对现有用户零行为变化（升级后老用户 $store 无此 key → 读到 false）。
+				 * 通过模式下若某小节总星数 < 2，阈值自动等价于"满星"（如 1 星小节需 1 星=满），无副作用。
+				 */
+				passMode: {
+					label: '通过即可（无需满星）',
+					attrs: { type: 'checkbox', title: '勾选后，闯关亮星≥2 即算完成；不勾选则必须满星' },
+					defaultValue: false
+				},
+				/**
+				 * 视频优先（两阶段）开关（MCP 实测确认 DOM，2026-06）。
+				 *
+				 * false（默认，现状）= 按章节交替：一个 A 类小节 = 看视频 + 立即闯关，一次进入。
+				 * true               = 全课两阶段：
+				 *   Phase1：进任意 A 类小节视频页后，study 脚本在视频页右侧 sidebar 上连续点击
+				 *           未完成项，把全课所有视频看完（不中途闯关），全绿后回目录；
+				 *   Phase2：回目录后按星级(passMode)逐节闯关。
+				 *
+				 * 视频页 sidebar 是全课所有 A 类子视频的扁平列表（实测 44 项），
+				 * 每项 dd.catalog-item-section 看完后带 span...col2.finish（绿点），
+				 * 点 dd 即跳该子视频。这是 Phase1 连续播放的导航依据。
+				 *
+				 * 默认 false：现有用户零行为变化（老用户 $store 无此 key → 读到 false）。
+				 * 阶段恢复用「懒推断」——study 每次进视频页重读 sidebar 真实状态决定走
+				 * Phase1 还是直接闯关，不存持久化 phase 标志，关浏览器重进/换设备都正确。
+				 */
+				videoFirst: {
+					label: '视频优先（先看完所有视频再闯关）',
+					attrs: { type: 'checkbox', title: '勾选：先在视频页连续看完所有视频，再回目录逐节闯关' },
+					defaultValue: false
+				}
 			},
 			methods() {
 				return {
-					main: async ({ canRun }: { canRun: () => boolean; job_id: string }) => {
-						CommonProject.scripts.render.methods.pin(this);
-						// 等待小节列表加载
-						await waitForElement('div.study', { timeout_seconds: 15 });
+						main: async ({ canRun }: { canRun: () => boolean; job_id: string }) => {
+							// 版本标记：course 脚本 main 被调用时立即输出。若后台日志看不到这条，
+							// 说明加载的是旧版本（@require 缓存未刷新），需重新触发油猴抓取。
+							$console.log('[moycp] course 脚本已启动 v2（星级判定版）');
+							// 闯关完成标准：按 config 读一次（this = Script 实例，main 内可访问 this.cfg）。
+							//   false（默认）= 满星才完成；true = 亮星≥2 即通过
+							const passMode = !!this.cfg.passMode;
+							CommonProject.scripts.render.methods.pin(this);
+							// 等待小节列表加载
+							await waitForElement('div.study', { timeout_seconds: 15 });
 						if (!canRun()) return;
 						await $.sleep(2000); // 等 Vue 完全渲染
 
-						// 收集所有"课件"按钮（每个对应一个小节）
+						// 收集所有入口按钮（每个小节的 div.study：A 类是「课件」，B 类是「练习」）
 						const getStudyButtons = () => Array.from(document.querySelectorAll<HTMLDivElement>('div.study'));
 						let studyButtons = getStudyButtons();
 
-						// 找到第一个未完成的小节（进度 < 100%）
-						// 每个课件按钮所在的 section 容器内有 .alreadyStudyProgress i 显示进度
-						//
-						// ⚠️ 历史问题：closest('[class*="section"],[class*="item"]') 会匹配大量无关祖先
-						// （页面里含 "section"/"item" 子串的类非常多），导致进度查询落空，fallback '0%'
-						// 把所有小节都误判为"未完成"，于是反复点进已看过的视频。
-						// 修复：沿父链向上有限步查找 .alreadyStudyProgress（不依赖单一层级），
-						//      找不到进度时按"已完成"跳过并打印诊断日志，避免死循环。
-						const findProgressElFor = (btn: HTMLElement): HTMLElement | null => {
-							// 向上最多 8 层父节点查找进度元素
+						/**
+						 * 沿父链向上查找小节根容器 dd.catalog-detail-dd
+						 *
+						 * ⚠️ 不用 closest('[class*="section"]')——页面里含 "section"/"item" 子串的类非常多，
+						 *    会匹配到大量无关祖先。dd.catalog-detail-dd 是慕享小节的稳定锚点。
+						 */
+						const findSectionDd = (btn: HTMLElement): HTMLElement | null => {
 							let node: HTMLElement | null = btn;
 							for (let i = 0; i < 8 && node; i++) {
-								const el = node.querySelector<HTMLElement>('.alreadyStudyProgress i');
-								if (el) return el;
+								if (node.classList?.contains('catalog-detail-dd')) return node;
 								node = node.parentElement;
 							}
 							return null;
 						};
-						const findUnfinishedSection = (): HTMLDivElement | undefined => {
+						/**
+						 * 判定小节类型（MCP 实测确认，2026-06）：
+						 * - A 类（视频+闯关）：dd 内有 .alreadyStudyProgress，目录按钮区 study=「课件」/chuangguan=「闯关」
+						 * - B 类（纯闯关/阶段作业/习题解析）：dd 内无 .alreadyStudyProgress，study=「练习」/chuangguan=「测试」
+						 *
+						 * ⚠️ 入口选择关键：
+						 *   A 类必须先点 study「课件」看视频（看完才能闯关）；
+						 *   B 类必须点 chuangguan「测试」进 exam 页（给满星），
+						 *   ⚠️ 不能点 study「练习」——练习只给 2 星且会重复，无法拿满星（历史 bug）。
+						 */
+						const getSectionType = (dd: HTMLElement | null): 'A' | 'B' => {
+							return dd?.querySelector('.alreadyStudyProgress') ? 'A' : 'B';
+						};
+
+						/**
+						 * 判定一个小节是否真正完成。
+						 *
+						 * 按章节类型分别判断（MCP 实测确认的 DOM 差异）：
+						 * - A 类（有 .alreadyStudyProgress）：完成 = 视频进度 100% 且 闯关星级满
+						 * - B 类（无 .alreadyStudyProgress，纯闯关）：完成 = 闯关星级满
+						 *
+						 * 星级读取：span.star img 的 src 区分亮/暗
+						 *   亮星 src 含 "Uew6vjOR0lU"，暗星 src 含 "L+A65AUzCw2U"（无 class 差异，只靠 src）
+						 *
+						 * ⚠️ 历史问题（已修复）：
+						 *   1. 旧代码只看视频进度，视频 100% 就跳过 → A 类「视频看完但星级不满」被遗漏
+						 *   2. 旧代码找不到进度元素就 continue → B 类（无视频的纯闯关章节）全部被跳过
+						 *
+						 * @returns 'finished'=已完成可跳过, 'unfinished'=未完成需进入, 'unknown'=无法判定（安全跳过）
+						 */
+						const checkSectionStatus = (btn: HTMLElement): 'finished' | 'unfinished' | 'unknown' => {
+							const dd = findSectionDd(btn);
+							const title = dd?.querySelector('.catalog-top span:last-child')?.textContent?.trim() || '未知小节';
+							if (!dd) {
+								$console.warn('[OCS-moycp] 未找到小节根容器 dd，无法判定状态:', title);
+								return 'unknown';
+							}
+
+							// 星级统计（两类章节都有星级）
+							const starImgs = Array.from(dd.querySelectorAll<HTMLImageElement>('span.star img'));
+							const litCount = starImgs.filter((img) => (img.getAttribute('src') || '').includes('Uew6vjOR0lU')).length;
+							const starTotal = starImgs.length;
+							// 星级达标判定（按「闯关完成标准」开关分支，passMode 来自 main 作用域）：
+							//   满星模式（默认）: litCount === starTotal
+							//   通过即可模式    : litCount >= 2（MCP 实测+用户确认，慕享 2 星 = 任务通过；
+							//                    总星数<2 时自动等价于满星，无副作用）
+							const starFull = starTotal > 0 && (passMode ? litCount >= 2 : litCount === starTotal);
+
+						// 视频进度（仅 A 类章节有）
+						const progressEl = dd.querySelector<HTMLElement>('.alreadyStudyProgress i');
+						const hasVideo = !!progressEl;
+						const progressText = hasVideo ? progressEl!.textContent?.trim() || '0%' : '无视频';
+						const videoDone = !hasVideo || (parseInt(progressText) || 0) >= 100; // B 类无视频默认已满足
+
+						// 判定结果（同时写后台日志面板 + 页面调试浮层，方便排查）
+						//
+						// ⚠️ 核心规则（MCP 实测确认，2026-06）：
+						//   课程目录的进度条（.alreadyStudyProgress）是章节聚合进度，会延迟/不准；
+						//   视频页右上角进度（span.alreadystudy）才准确。
+						//   完成判定 = 星级满 且（目录进度100% 或 视频完成缓存命中）。
+						//
+						//   "视频完成缓存"记录的是"该章节视频已在视频页右上角确认 100%"（study 脚本写入）。
+						//   这样解决"星级满但目录进度<100%"的死循环：
+						//     - 目录进度已100% → finished（正常）
+						//     - 目录进度<100% 但缓存命中 → finished（目录延迟，视频页已二次验证过100%）
+						//     - 目录进度<100% 且缓存未命中 → unfinished（course 会主动进视频页二次验证，
+						//       study 确认右上角100%后写缓存，回目录后下次判 finished）
+						//     - 星级未满 → unfinished（需继续看视频+闯关，不跳过视频环节）
+						const courseId = new URLSearchParams(location.search).get('courseId') || '';
+						const videoDoneCached = videoDoneCache.has(courseId, title);
+						const status: 'finished' | 'unfinished' =
+							starFull && (videoDone || videoDoneCached) ? 'finished' : 'unfinished';
+						const type = hasVideo ? 'A视频+闯关' : 'B纯闯关';
+						$dbg(
+							`判定: ${title} | 类型=${type} | 模式=${passMode ? '通过(≥2星)' : '满星'} | 视频=${progressText} | 星级=${litCount}/${starTotal} | 缓存=${videoDoneCached ? '命中' : '未命中'} | 结果=${status}`
+						);
+						return status;
+						};
+
+						/**
+						 * 找第一个未完成的小节
+						 *
+						 * 防死循环：用 triedKeys 记录本轮已选中过的未完成小节标题，
+						 * 如果同一小节被二次选中（说明补闯关后星级没变化，题库无答案等），
+						 * 就不再选它，避免无限循环进入。
+						 */
+						const findUnfinishedSection = (triedKeys?: Set<string>): HTMLDivElement | undefined => {
 							studyButtons = getStudyButtons();
 							for (const btn of studyButtons) {
-								const progressEl = findProgressElFor(btn);
-								if (!progressEl) {
-									// 找不到进度元素：无法判定，按已完成跳过（不再误判为 0% 进度）
-									console.warn('[OCS-moycp] 未找到进度元素，跳过该小节（视为已完成）:', btn);
-									continue;
+								if (checkSectionStatus(btn) !== 'unfinished') continue;
+								// 防死循环：已尝试过且状态未变的小节跳过
+								if (triedKeys) {
+									const dd = findSectionDd(btn);
+									const title =
+										dd?.querySelector('.catalog-top span:last-child')?.textContent?.trim() || '未知小节';
+									const key =
+										title +
+										'|' +
+										(dd?.querySelector('.alreadyStudyProgress i')?.textContent?.trim() || '') +
+										'|' +
+										Array.from(dd?.querySelectorAll('span.star img') || []).filter((img) =>
+											(img.getAttribute('src') || '').includes('Uew6vjOR0lU')
+										).length;
+									if (triedKeys.has(key)) {
+										$dbg(`跳过已尝试且状态未变的小节: ${title}（可能题库无答案）`);
+										continue;
+									}
+									triedKeys.add(key);
 								}
-								const progressText = progressEl.textContent?.trim() || '0%';
-								const progress = parseInt(progressText) || 0;
-								if (progress < 100) {
-									return btn;
-								}
+								return btn;
 							}
 							return undefined;
 						};
 
 						let safetyCount = 0;
 						const MAX_ITERATIONS = 50; // 防死循环
+						// 防死循环：记录已尝试过且状态未变化的未完成小节（如题库无答案，补闯关后星级不变）
+						const triedKeys = new Set<string>();
+						//
+						// ⚠️ videoFirst（视频优先）两阶段模式下，course 脚本【故意不感知阶段】：
+						//   始终按「星级未达标(passMode)」找未完成小节进入。阶段切换完全由 study 脚本在
+						//   视频页读 sidebar 真实状态懒判定（详见 study main 的 videoFirst 分流）。
+						//   这样恢复天然正确：重进目录时 course 照常按星级找小节，进视频页后 study 按
+						//   sidebar 决定走 Phase1（连续播放）还是直接闯关（Phase2/恢复），零持久化标志。
+						//   防死循环：triedKeys 已覆盖「course 反复进同一 A 类小节」——补闯关后星级不变
+						//   的小节 key 不变会被跳过；若视频完成后目录进度变化导致 key 变，study 进视频页
+						//   会发现 sidebar 全 finish 直接闯关（Phase2），自纠不空转。
 
 						while (canRun() && safetyCount < MAX_ITERATIONS) {
 							safetyCount++;
-							const unfinishedBtn = findUnfinishedSection();
+							const unfinishedBtn = findUnfinishedSection(triedKeys);
 							if (!unfinishedBtn) {
-								$msg_and_log('info', '当前页所有小节已完成，返回上一页继续。');
+								if (triedKeys.size > 0) {
+									// 文案按完成标准分支：满星模式说"未满星"，通过模式说"未通过"
+									const adj = passMode ? '未通过' : '未满星';
+									$msg_and_log(
+										'warn',
+										`当前页仍有 ${triedKeys.size} 个小节${adj}，但已尝试补闯关且状态未变化（可能题库无答案），跳过并返回上一页。`
+									);
+									$dbg(`流程: 仍有 ${triedKeys.size} 个小节${adj}且状态不变，返回上一页`);
+								} else {
+									$msg_and_log('info', '当前页所有小节已完成，返回上一页继续。');
+									$dbg('流程: 当前页所有小节已完成，返回上一页');
+								}
 								await $.sleep(1500);
 								history.back();
 								return;
@@ -222,9 +356,53 @@ export const MoycpProject = Project.create({
 							}
 
 							$msg_and_log('info', `进入小节学习：${sectionName}`);
-							// 点击课件按钮 → URL 变成 /courseware2 → dispatcher 触发 study 脚本
-							unfinishedBtn.click();
-							unfinishedBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+							// 按章节类型选择正确入口按钮（MCP 实测确认，2026-06）：
+							//   A 类（有视频）：点 study「课件」→ 看视频 → 视频页 study 脚本接管
+							//   B 类（纯闯关/阶段作业）：点 chuangguan「测试」→ 进 exam 页 → work 脚本答题拿满星
+							//     ⚠️ B 类绝不能点 study「练习」（只给 2 星、会重复，无法满星）
+							const dd = findSectionDd(unfinishedBtn);
+							const sectionType = getSectionType(dd);
+							let entryBtn: HTMLElement = unfinishedBtn;
+							if (sectionType === 'B') {
+								// B 类：找同 dd 内的「测试/闯关」按钮（div.chuangguan）
+								const cgBtn = dd?.querySelector<HTMLElement>('div.chuangguan');
+								if (cgBtn) {
+									entryBtn = cgBtn;
+									$dbg(`流程: B 类小节「${sectionName}」点「测试」进 exam 页（点练习只给 2 星）`);
+								} else {
+									$dbg(`流程: B 类小节「${sectionName}」未找到 chuangguan 按钮，回退点 study`);
+								}
+							}
+							$dbg(`流程: 进入小节学习「${sectionName}」（类型=${sectionType}，第 ${safetyCount}/${MAX_ITERATIONS} 次迭代）`);
+							// 点击入口按钮 → A 类进 /courseware2（study 接管）；B 类进 /study?type=exam（work 接管）
+							entryBtn.click();
+							entryBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+							// 自动确认慕享的"进入练习/学习"确认弹窗
+							//
+							// ⚠️ 历史问题：B 类章节（习题解析）点「练习」后，慕享会弹
+							//   Element Plus 的 MessageBox（.el-message-box，文案"准备好去练习了吗？"，
+							//   带「取消」「确定」按钮）。旧代码点击后只等 URL 变化、不点确定，
+							//   导致 URL 一直不变，死等到 600 秒超时。
+							//
+							// 修复：点击 study 后轮询几秒，若出现 .el-message-box 就自动点「确定」，
+							//      让页面能正常跳转。限定在 .el-message-box 内找确定按钮，避免误点其他弹窗。
+							// （A 类章节点「课件」通常不弹此框，轮询不到就正常超时放行，无副作用。）
+							const dismissMoycpConfirmDialog = async (timeoutMs = 5000): Promise<boolean> => {
+								const findMbConfirm = (): HTMLButtonElement | null =>
+									document.querySelector<HTMLButtonElement>(
+										'.el-message-box .el-button--primary'
+									);
+								const btn = await waitFor(findMbConfirm, { timeout_seconds: Math.ceil(timeoutMs / 1000) });
+								if (btn) {
+									$dbg('流程: 检测到慕享确认弹窗，自动点击「确定」');
+									btn.click();
+									btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+									return true;
+								}
+								return false;
+							};
+							await dismissMoycpConfirmDialog();
 
 							// 等待离开当前页面（study 脚本接管后会跳到 /courseware2）
 							// study 处理完（视频+答题）后会 history.back 回到这里
@@ -235,9 +413,33 @@ export const MoycpProject = Project.create({
 								// 600秒超时（一个完整视频+答题可能很久）
 								await $.sleep(2000);
 								waited += 2000;
-								// 离开了目录页，说明 study 接管了
+								// 离开了目录页，说明 study/work 接管了
 								if (location.pathname !== startPath) break;
 							}
+
+							// ⚠️ 主动触发答题脚本（补 dispatcher 的缺口）
+							//
+							// 当从目录点「练习/闯关」SPA 跳转到答题页时，work 脚本可能不被触发：
+							//   - oncomplete 只在页面首次加载时跑一次，SPA 跳转不会再触发它；
+							//   - dispatcher 靠 script.cfg.runAtUrl 匹配，但 cfg 走 $store 持久化，
+							//     老用户的 store 里缓存着旧版首次写入的 ['type=exam']，覆盖了新的
+							//     defaultValue（含 type=practice），导致 practice 页 dispatcher 匹配不到 work。
+							//   （表现为：刷新就好[oncomplete 硬编码匹配]，SPA 跳转不触发[dispatcher 旧 cfg]。）
+							//
+							// 修复：检测到已跳转到答题页（exam/practice）后，主动调用 work.main，
+							//      复用 study→work 的主动触发模式，绕开 dispatcher 的过期持久化 cfg。
+							//      互斥由 state.currentRunningScriptName 保证（work.main 内部也有 workRunning 锁）。
+							if (urlMatches(['type=exam', 'type=practice']) && state.currentRunningScriptName !== MoycpProject.scripts.work.name) {
+								$dbg('流程: 检测到跳转到答题页，主动触发闯关答题脚本（绕过 dispatcher 旧 cfg）');
+								state.currentUrl = location.href;
+								state.currentRunningScriptName = MoycpProject.scripts.work.name;
+								state.current_job_id = Math.random().toString(16).slice(2);
+								MoycpProject.scripts.work.methods?.main?.({
+									canRun: () => urlMatches(['type=exam', 'type=practice']),
+									job_id: state.current_job_id
+								});
+							}
+
 							// 等 study/work 处理完，URL 变回 courseDetail
 							while (canRun() && waited < 600000) {
 								await $.sleep(2000);
@@ -329,60 +531,221 @@ export const MoycpProject = Project.create({
 						};
 						await waitForDuration();
 
-						// 若已停在结尾，重置到开头重播（避免瞬间误判完成）
-						if (media.duration && media.currentTime >= media.duration - 0.5) {
-							console.log('[OCS-moycp] 进入页面时视频已在结尾，重置到开头重播');
-							try {
-								media.currentTime = 0;
-							} catch {
-								/* 忽略重置失败 */
+						/**
+						 * 判定该视频是否已学完（MCP 实测确认，2026-06）。
+						 *
+						 * 慕享视频页对"已看过"的视频会渲染出进度标记：
+						 *   <span class="alreadystudy">已学习100%</span>
+						 * 这是慕享自带的"该视频已完成学习"信号，稳定可靠。
+						 *
+						 * ⚠️ 历史问题：下方"视频在结尾就重置重播"的兜底逻辑会把
+						 *   已学完的视频也一起从头重播——对一个视频 100% 但星级未满的章节，
+						 *   每次进入都被迫重看整段视频才去闯关，严重浪费时间。
+						 *   修复：检测到已学完标记时跳过播放流程，直接去闯关。
+						 *
+						 * 判据：span.alreadystudy 存在，且解析出的百分比 ≥ 100%
+						 * （兼容 "已学习100%" / "已学习 100%" 等格式）。
+						 */
+						const isVideoAlreadyStudied = (): boolean => {
+							const mark = document.querySelector('span.alreadystudy');
+							if (!mark) return false;
+							// ⚠️ 必须解析百分比，只有 100% 才算学完（MCP 实测确认，2026-06）。
+							//   旧逻辑用 txt.includes('已学习') 会把"已学习1%"也判为已学完 →
+							//   视频才看 1% 就跳过播放直接闯关（"无脑跳练习"bug）。
+							//   span.alreadystudy 文本格式："已学习100%" / "已学习 1%" 等。
+							const txt = (mark.textContent || '').replace(/\s+/g, '');
+							const m = txt.match(/已学习(\d+)%/);
+							return !!m && parseInt(m[1]) >= 100;
+						};
+
+					/**
+					 * 视频确认完成后，写入"视频完成缓存"（供目录页 checkSectionStatus 读取）。
+					 *
+					 * 缓存 key = courseId + 章节标题。
+					 * ⚠️ 视频页与目录页的章节标题选择器不同（MCP 实测确认，2026-06）：
+					 *   - 视频页：span.itemName（在 .vertical-line-left 内）
+					 *   - 目录页：.catalog-top span:last-child
+					 *   两处读到的标题文本一致（如"函数与极限"），保证 key 对齐。
+					 * courseId 从视频页 URL 参数读取（/courseware2?courseId=...）。
+					 */
+					const markVideoDoneInCache = (): void => {
+						const courseId = new URLSearchParams(location.search).get('courseId') || '';
+						// 视频页章节标题：优先 span.itemName，回退 .catalog-top（兼容不同课程布局）
+						const sectionTitle =
+							document.querySelector('span.itemName')?.textContent?.trim() ||
+							document.querySelector('.catalog-top span:last-child')?.textContent?.trim() ||
+							'';
+						if (courseId && sectionTitle) {
+							videoDoneCache.set(courseId, sectionTitle);
+							$dbg(`流程: 视频完成缓存已写入 [${courseId}] ${sectionTitle}`);
+						}
+					};
+
+					const alreadyStudied = isVideoAlreadyStudied();
+
+					if (alreadyStudied) {
+						// 视频已学完（右上角 span.alreadystudy 确认）：跳过播放，直接去闯关
+						// 同时写入完成缓存——目录页若进度条延迟<100%，靠此缓存判 finished，避免死循环
+						markVideoDoneInCache();
+						$msg_and_log('info', '该视频已学完，跳过播放直接去闯关');
+						$dbg('流程: 检测到 span.alreadystudy（已学习），跳过重播');
+						} else {
+							// 视频未学完：正常播放
+							// 若已停在结尾，重置到开头重播（避免瞬间误判完成）
+							if (media.duration && media.currentTime >= media.duration - 0.5) {
+								console.log('[OCS-moycp] 进入页面时视频已在结尾，重置到开头重播');
+								try {
+									media.currentTime = 0;
+								} catch {
+									/* 忽略重置失败 */
+								}
 							}
-						}
 
-						const startCurrentTime = media.currentTime;
+							const startCurrentTime = media.currentTime;
 
-						// 播放
-						const played = await playMedia(() => media.play());
-						if (!played) {
-							$msg_and_log('error', '视频播放失败，请手动点击播放后重试。');
-							return;
-						}
+							// 播放
+							const played = await playMedia(() => media.play());
+							if (!played) {
+								$msg_and_log('error', '视频播放失败，请手动点击播放后重试。');
+								return;
+							}
 
-						// 等待播放结束
-						// 关键：必须先"真正播放过"（currentTime 比 startCurrentTime 推进 ≥1秒），
-						// 才允许 ended / 结尾兜底判定触发，否则会瞬间误判完成。
-						await new Promise<void>((resolve) => {
-							let playedEnough = false;
-							const onEnd = () => {
-								media.removeEventListener('ended', onEnd);
-								resolve();
-							};
-							media.addEventListener('ended', onEnd);
-							// 轮询兜底（自研播放器 ended 事件可能不触发）
-							const interval = setInterval(() => {
-								if (!canRun()) {
-									clearInterval(interval);
+							// 等待播放结束
+							// 关键：必须先"真正播放过"（currentTime 比 startCurrentTime 推进 ≥1秒），
+							// 才允许 ended / 结尾兜底判定触发，否则会瞬间误判完成。
+							await new Promise<void>((resolve) => {
+								let playedEnough = false;
+								const onEnd = () => {
 									media.removeEventListener('ended', onEnd);
 									resolve();
+								};
+								media.addEventListener('ended', onEnd);
+								// 轮询兜底（自研播放器 ended 事件可能不触发）
+								const interval = setInterval(() => {
+									if (!canRun()) {
+										clearInterval(interval);
+										media.removeEventListener('ended', onEnd);
+										resolve();
+										return;
+									}
+									// 标记"已真正播放"
+									if (!playedEnough && media.currentTime - startCurrentTime >= 1) {
+										playedEnough = true;
+									}
+									// 仅在确实播放过之后，才允许结尾/ended 触发完成
+									if (playedEnough && (media.ended || media.currentTime >= media.duration - 0.5)) {
+										clearInterval(interval);
+										media.removeEventListener('ended', onEnd);
+										resolve();
+									}
+								}, 1000);
+							});
+
+							if (!canRun()) return;
+							// 视频自然播完：同样写入完成缓存（与"右上角已学习"走同一缓存，供目录页判定）
+							markVideoDoneInCache();
+							$msg_and_log('info', '视频学习完成');
+						}
+
+					/**
+					 * 视频优先（videoFirst）两阶段：视频播完后的分流。
+					 *
+					 * MCP 实测确认 DOM（2026-06，真实 /courseware2 页面）：
+					 *   视频页右侧 sidebar 是全课所有 A 类子视频的扁平列表（实测 44 项）：
+					 *     dd.catalog-item-section（每项一个），title="子视频名"；
+					 *     当前播放 dd 带 .current；看完的 dd 内 span.catalog-item-section-col2 带 .finish（绿点）。
+					 *   点 dd（cursor:pointer）即跳该子视频（改 URL 的 itemId）。
+					 *   播放器内无「下一节」按钮 → 跨视频导航只能点 sidebar。
+					 *
+					 * 分流规则（阶段恢复靠 sidebar 真实状态懒判定，零持久化标志）：
+					 *   videoFirst=false（现状）：直接走下方「点去闯关」逻辑。
+					 *   videoFirst=true：
+					 *     sidebar 还有未 finish 项 → Phase1：点第一个「未完成且非当前」的 dd，校验导航成功
+					 *       （.current 切到 target）后【自重入 study.main】播下一子视频（⚠️ sidebar 跳转
+					 *       URL 不变，dispatcher 不会重入，必须自重入）；连续点同一 dd 无变化 3 次则跳过
+					 *     sidebar 全 finish → 走下方「点去闯关」（Phase2 / 重进恢复场景，不重看视频）
+					 */
+					const videoFirst = !!MoycpProject.scripts.course.cfg.videoFirst;
+					if (videoFirst && canRun()) {
+						/**
+						 * 读 sidebar 所有「未完成 且 非当前播放」的子视频项。
+						 * 「完成」= dd 内 span.catalog-item-section-col2 带 .finish（MCP 实测确认）。
+						 * 「非当前」= 不带 .current —— 刚播完的就是 .current，点它不会导航（内容已在播放），
+						 *   必须排除，否则误判「点击无响应」。
+						 */
+						const getUnfinishedSidebarItems = (): HTMLElement[] =>
+							Array.from(document.querySelectorAll<HTMLElement>('dd.catalog-item-section')).filter(
+								(dd) =>
+									!dd.querySelector('.catalog-item-section-col2.finish') &&
+									!dd.classList.contains('current')
+							);
+
+						const unfinished = getUnfinishedSidebarItems();
+						$dbg(`videoFirst: sidebar 未完成（且非当前）子视频 ${unfinished.length} 项`);
+
+						if (unfinished.length > 0) {
+							// Phase1：还有未完成视频，不闯关，点 sidebar 跳到下一未完成项继续播放
+							const target = unfinished[0];
+							const targetTitle = target.getAttribute('title') || '';
+							$msg_and_log('info', `视频优先：继续播放下一未完成视频「${targetTitle}」`);
+
+							// 防死循环：记录本轮点过且状态未变的 dd（点了但导航没成功）
+							// 用模块级 state 暂存（会话内有效），key=title。
+							if (!state.videoFirstTried) state.videoFirstTried = {};
+							const tried = state.videoFirstTried;
+
+							target.click();
+							target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+							// 校验导航成功（MCP 实测确认，2026-06）：
+							//   ⚠️ 慕享 sidebar 跳转是「原地换内容」，URL 的 itemId 参数【不变】！
+							//   只能用 sidebar 的 .current 是否切到 target 来判定导航成功。
+							//   （旧思路用 itemId 变化校验会永远失败，误报 Vue 拦截。）
+							let navigated = false;
+							for (let w = 0; w < 5000; w += 500) {
+								await $.sleep(500);
+								if (!canRun()) return;
+								if (target.classList.contains('current')) {
+									navigated = true;
+									break;
+								}
+							}
+							if (!navigated) {
+								// 点击未生效：标记该 dd 已试，避免反复点同一个无响应项卡死
+								tried[targetTitle] = (tried[targetTitle] || 0) + 1;
+								if (tried[targetTitle] >= 3) {
+									$msg_and_log(
+										'error',
+										`视频优先：连续 3 次点击「${targetTitle}」未跳转，可能 Vue 拦截，跳过该视频（需手动检查）。`
+									);
+									// 跳过：直接回目录，交还 course 脚本
+									await $.sleep(1500);
+									history.back();
 									return;
 								}
-								// 标记"已真正播放"
-								if (!playedEnough && media.currentTime - startCurrentTime >= 1) {
-									playedEnough = true;
-								}
-								// 仅在确实播放过之后，才允许结尾/ended 触发完成
-								if (playedEnough && (media.ended || media.currentTime >= media.duration - 0.5)) {
-									clearInterval(interval);
-									media.removeEventListener('ended', onEnd);
-									resolve();
-								}
-							}, 1000);
-						});
+								$msg_and_log('warn', `视频优先：点击「${targetTitle}」未跳转，重试中（第 ${tried[targetTitle]} 次）`);
+								// 本次 main 结束；URL 没变 dispatcher 不会重入，但下次 course 重入或刷新会再触发
+								return;
+							}
+							// 导航成功：sidebar 跳转是「原地换内容」，URL 不变 → dispatcher 不会重入！
+							// 必须由本脚本自己重入 study.main 播放新视频（新 <video> 元素已替换）。
+							$dbg(`videoFirst: 已跳转到「${targetTitle}」，主动重入 study.main 播放新视频`);
+							// 先等新视频元素就绪（慕享替换 <video> 需要渲染时间），再重入
+							await $.sleep(1500);
+							if (!canRun()) return;
+							// 自重入：复用同一 main，canRun 仍按 videoFirst 的 runAtUrl（/courseware2）判定。
+							// 不动 dispatcher 状态——URL 没变，dispatcher 本就不会干扰。
+							// 用 this.methods（this = 当前 Script 实例），避免引用 MoycpProject 触发循环类型推断。
+							return (this.methods as any)?.main?.({
+								canRun,
+								job_id: state.current_job_id
+							});
+					}
+					// sidebar 全 finish：Phase1 已完成（或重进恢复场景），落到下方「点去闯关」逻辑
+					$dbg('videoFirst: sidebar 全部视频已完成，进入闯关（Phase2/恢复）');
+					}
 
-						if (!canRun()) return;
-						$msg_and_log('info', '视频学习完成');
-
-						// 视频播完，尝试自动点击「去闯关」进入答题页
+					// 视频播完，尝试自动点击「去闯关」进入答题页
 						// 慕享会先弹确认框「准备好去闯关了吗？」需自动确认
 						//
 						// ⚠️ 历史问题：确认按钮用 textContent === '确定' 过严（可能是"确 定"/带图标/含空格），
@@ -503,8 +866,16 @@ export const MoycpProject = Project.create({
 				},
 				// runAtUrl 供 dispatcher 匹配。
 				// ⚠️ 不能用 '/study?type=exam'——实际 URL 参数顺序是 /study?courseId=xxx&...&type=exam，
-				// '/study?type=exam' 作为整体子串匹配不到。用 'type=exam' 这个唯一标识。
-				runAtUrl: { defaultValue: ['type=exam'] }
+				// '/study?type=exam' 作为整体子串匹配不到。用 'type=exam'/'type=practice' 这个唯一标识。
+				//
+				// 同时匹配 exam 与 practice（MCP 实测确认，2026-06）：
+				//   - exam（type=exam）：统一提交 button.submit → 出结算页 → 回目录
+				//   - practice（type=practice）：逐题即时反馈，无 button.submit，由 practiceFinish 脚本
+				//     点「完成」(div.btn.submit.finished) 收尾
+				//   两种模式的答题面板/下一题按钮(.btn.next)结构一致，答题循环可共用 workAndExam，
+				//   仅最后提交环节不同（见 moycp-work.ts 提交逻辑对 practice 的跳过处理）。
+				//   若只匹配 exam，practice 页 82 题会晾着无人作答（历史 bug）。
+				runAtUrl: { defaultValue: ['type=exam', 'type=practice'] }
 			},
 			methods() {
 				const start = async (canRun: () => boolean, onWorkerCreated?: (worker: any) => void) => {
@@ -519,28 +890,23 @@ export const MoycpProject = Project.create({
 					CommonProject.scripts.render.methods.normal();
 
 					$msg_and_log('info', '开始答题');
+					// ⚠️ worker 实例缓存（修复"点暂停无效"问题）。
+					//
+					// 根因：commonWork 控制面板的「暂停/继续」按钮在 onclick 里会【每次重新调用】
+					// workerProvider()（见 utils/work.ts 的 controlBtn.onclick），而 workAndExam 内部
+					// 每次 `new OCSWorker(...)`。若不缓存，点暂停时 workerProvider() 会创建一个全新空壳
+					// worker，emit('stop') 发到空壳上，真正在答题循环里运行的 worker 收不到 → 暂停无效。
+					//
+					// 修复：首次调用（commonWork 启动答题，带 opts）创建并缓存；后续调用（暂停/继续按钮，
+					// 无参）直接返回缓存的同一实例，让 emit 命中真实 worker。
+					let _cachedWorker: ReturnType<typeof workAndExam> | null = null;
 					commonWork(this, {
-					workerProvider: (opts) => {
-						const worker = workAndExam(opts);
-						// 不再设置 canRun 导航守卫（原 1 秒轮询 canRun() 的 interval 已删除）。
-						//
-						// 理由（调研确认）：
-						//   1. 答题循环 + answerOne 内部从不修改 location（仅点击选项/答题卡，
-						//      不导航），所以正常会话内 canRun() 本应恒为 true。
-						//   2. 唯一的 false 来源是 Vue Router 渲染答题卡的中间态 URL（router
-						//      可能短暂 replaceState），持续可能 >2 秒，2 次防抖也覆盖不住，
-						//      导致会话被误杀（用户日志证实："开始答题" 后立即误报"检测到页面切换"）。
-						//   3. 这个守卫是从 icourse 复制的，但 icourse 是 playwright 远程环境 +
-						//      hash 路由（离散导航无中间态）；moycp 是浏览器内 + URL 路由 +
-						//      URL 驱动调度，架构不匹配。
-						//
-						// 安全性：循环有 3 重自行终止兜底，不依赖守卫——
-						//   - MAX_ROUNDS=3 硬上限
-						//   - prevUnansweredCount 两轮无进展即停
-						//   - DOM 变空收敛（导航后答题卡为空 → unanswered=0 → break）
-						// 手动暂停(worker.isStop)/重启(restart)通过 OCSWorker 事件机制，与守卫无关。
-						return worker;
-					},
+						workerProvider: (opts?: any) => {
+							if (!_cachedWorker) {
+								_cachedWorker = workAndExam(opts);
+							}
+							return _cachedWorker;
+						},
 						onWorkerCreated: onWorkerCreated,
 						enable_control_panel: true,
 						start_delay_seconds: 3
@@ -558,15 +924,34 @@ export const MoycpProject = Project.create({
 							console.log('[OCS-moycp] work.main 正在执行中，跳过并发重入');
 							return;
 						}
-						state.workRunning = true;
-						try {
-							$msg_and_log('info', '闯关答题脚本被触发');
-							// 等页面完全加载（Vue 渲染需要时间）
-							await $.sleep(2000);
-							return await start(canRun);
-						} finally {
-							state.workRunning = false;
+					state.workRunning = true;
+					try {
+						$msg_and_log('info', '闯关答题脚本被触发');
+						// 等页面完全加载（Vue 渲染需要时间）
+						await $.sleep(2000);
+						return await start(canRun);
+					} finally {
+						state.workRunning = false;
+						// practice 模式答题结束后，主动触发练习完成脚本点「完成」收尾。
+						//
+						// ⚠️ 为什么需要主动触发：dispatcher 用单一 currentRunningScriptName 互斥锁，
+						//   答题期间锁卡在 work（脚本遍历顺序 work 在 practiceFinish 前）。
+						//   而 practice 页答完题 URL 不变 → dispatcher 不会清锁（仅 URL 变化才清）
+						//   → practiceFinish 永远等不到锁，答完的「完成」按钮无人点。
+						//   exam 模式无此问题（提交后出结算页→回目录，URL 会变）。
+						//   这里复用 study→work 的主动触发模式兜底。互斥由 practiceFinish 内部
+						//   的「等完成按钮」逻辑天然保证（按钮未出现它就空转）。
+						if (location.search.includes('type=practice')) {
+							const practiceScript = MoycpProject.scripts.practiceFinish;
+							$dbg('流程: practice 答题结束，主动触发练习完成脚本');
+							state.currentRunningScriptName = practiceScript.name;
+							state.current_job_id = Math.random().toString(16).slice(2);
+							practiceScript.methods?.main?.({
+								canRun: () => urlMatches(practiceScript.cfg.runAtUrl as string[]),
+								job_id: state.current_job_id
+							});
 						}
+					}
 					},
 					start: start
 				};
@@ -575,681 +960,109 @@ export const MoycpProject = Project.create({
 				// ⚠️ 关键修复：oncomplete 必须能自启动，不能只依赖 dispatcher。
 				//
 				// 框架的 getMatchedScripts 只在页面加载时执行一次。
-				// - 用户【刷新】进入 type=exam 页：框架匹配到本脚本，oncomplete 触发
+				// - 用户【刷新】进入 type=exam/type=practice 页：框架匹配到本脚本，oncomplete 触发
 				//   → 这里自启动 main（这正是"刷新就好"的原因）。
-				// - 用户【从视频点去闯关】SPA 跳转进来：框架不会重新匹配，
+				// - 用户【从视频点去闯关 / 从目录点练习】SPA 跳转进来：框架不会重新匹配，
 				//   oncomplete 不触发；此时由 study 脚本主动调用 work.main 兜底，
 				//   同时 dispatcher 的 setInterval 也会尝试匹配。
 				//
 				// 三条路径中任意一条命中即可，state.currentRunningScriptName 做互斥，
 				// 保证 work.main 只触发一次。
-				if (urlMatches(['type=exam']) && state.currentRunningScriptName !== this.name) {
+				if (urlMatches(['type=exam', 'type=practice']) && state.currentRunningScriptName !== this.name) {
 					state.currentUrl = location.href;
 					state.currentRunningScriptName = this.name;
 					state.current_job_id = Math.random().toString(16).slice(2);
 					this.methods?.main?.({
-						canRun: () => urlMatches(['type=exam']),
+						canRun: () => urlMatches(['type=exam', 'type=practice']),
 						job_id: state.current_job_id
 					});
 				}
+			}
+		}),
+		/**
+		 * 练习页「完成」按钮脚本
+		 *
+		 * practice 模式（examType=4, type=practice）与 exam 模式流程不同：
+		 *   exam：全部答完→统一提交（button.submit）→出结算页→回目录（由 work 脚本接管）
+		 *   practice：逐题答题，每题即时显示正确答案，最后一题点「完成」收尾（div.btn.submit.finished）
+		 *
+		 * 答题环节由 work 脚本统一承担（runAtUrl 同时匹配 type=exam 与 type=practice，
+		 * 复用 workAndExam 逐题答题循环）。但 work 的统一提交对 practice 跳过（practice 无
+		 * button.submit），所以练习答完后「完成」按钮仍无人点击。本脚本专门补这个缺口：
+		 * 检测到「完成」按钮可见即点击，然后回目录页。
+		 *
+		 * ⚠️ 本脚本只负责 practice 的收尾点击，不参与答题/提交，与 work 答题逻辑互不影响。
+		 * 选择器区别（MCP 实测确认）：
+		 *   - exam 页提交按钮：button.submit（HTMLButtonElement）
+		 *   - practice 页完成按钮：div.btn.submit.finished（HTMLDivElement，class 含 finished）
+		 */
+		practiceFinish: new Script({
+			name: '✅ 练习完成脚本',
+			namespace: 'moycp.practice-finish-v1',
+			matches: [['练习页', 'moycp.com/study']],
+			hideInPanel: false,
+			configs: {
+				runAtUrl: { defaultValue: ['type=practice'] }
+			},
+			methods() {
+				return {
+					main: async ({ canRun }: { canRun: () => boolean; job_id: string }) => {
+						$dbg('practice 脚本: 启动，等待「完成」按钮');
+						// 等待练习页加载（答题面板出现）
+						await waitForElement('.answer-panel-container, .answer-panel-content', { timeout_seconds: 15 });
+						if (!canRun()) return;
+
+						// 轮询等待「完成」按钮出现（practice 模式答到最后一题时才显示）
+						// ⚠️ 双重条件，避免误点：
+						//   1. .btn.submit.finished 存在（完成按钮就绪）
+						//   2. 答题卡全部已答（.already 数 === 总数），防止中途短暂出现 finished 导致误点
+						let finishBtn: HTMLElement | null = null;
+						for (let w = 0; w < 60000; w += 1000) {
+							if (!canRun()) return;
+							finishBtn = document.querySelector<HTMLElement>('.btn.submit.finished');
+							if (finishBtn) {
+								const spans = document.querySelectorAll('.select-item-list span');
+								const answered = document.querySelectorAll('.select-item-list span.already');
+								// 答题卡为空（可能 Vue 未渲染）或全部已答时才确认
+								if (spans.length === 0 || answered.length === spans.length) break;
+							}
+							await $.sleep(1000);
+						}
+
+						if (!finishBtn) {
+							$dbg('practice 脚本: 60 秒内未检测到「完成」按钮，退出');
+							return;
+						}
+
+						$dbg('practice 脚本: 检测到「完成」按钮，点击');
+						await $.sleep(1500 + Math.random() * 1500); // 模拟人工延迟
+						if (!canRun()) return;
+
+						finishBtn.click();
+						finishBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+						// 点击后等待页面响应。若慕享已自动跳转（URL 变化），则不强行导航，避免冲突。
+						const urlBefore = location.href;
+						await $.sleep(2500);
+						if (!canRun()) return;
+
+						if (location.href !== urlBefore) {
+							$dbg('practice 脚本: 点击后慕享已自动跳转，不重复导航');
+							return;
+						}
+
+						// 未自动跳转，则手动回目录页（复用 work 脚本的回退方式）
+						const courseId = new URLSearchParams(location.search).get('courseId');
+						$dbg(`practice 脚本: 已点击完成，回目录页 (courseId=${courseId || '无'})`);
+						if (courseId) {
+							location.href = `/courseDetail/catalog?courseId=${courseId}`;
+						} else {
+							history.back();
+						}
+					}
+				};
 			}
 		})
 	}
 });
 
-function waitForQuestion() {
-	return new Promise<void>((resolve) => {
-		const interval = setInterval(() => {
-			// 慕享答题页题目根容器
-			if (document.querySelector('.answer-panel-container')) {
-				clearInterval(interval);
-				resolve();
-			}
-		}, 1000);
-	});
-}
-
-/**
- * 慕享答题工作器
- *
- * 慕享答题为单题逐题展示：每次屏幕只显示一题，
- * root 选择器指向单题容器即可，OCSWorker 会逐个处理当前可见题目。
- *
- * ⚠️ 慕享是 Vue 应用，选项的 .click() 会被框架拦截而失效，
- *    必须用 `input.checked = true; dispatchEvent('change')` 触发 Vue 响应。
- *    选中后慕享不会自动跳题，需由外层 while 循环点击 .btn.next 翻页。
- */
-function workAndExam(
-	{ answererWrappers, redundanceWordsText, upload, stopSecondWhenFinish, answerSeparators }: CommonWorkOptions
-) {
-	CommonProject.scripts.workResults.methods.init({
-		questionPositionSyncHandlerType: 'moycp'
-	});
-
-	/** 题目文本转换：移除冗余词、压缩空白 */
-	const titleTransform = (titles: (HTMLElement | undefined)[]) => {
-		return removeRedundantWords(
-			titles
-				.filter((t) => t?.innerText || t?.querySelector('img'))
-				.map((t) => {
-					if (t) {
-						const el = optimizationElementWithImage(t, true);
-						return (el.textContent || '').replace(/\s+/g, ' ').trim() || '';
-					}
-					return '';
-				})
-				.filter((t) => t.trim() !== '')
-				.join(','),
-			redundanceWordsText.split('\n')
-		);
-	};
-
-	/**
-	 * 解析结算页的正确答案。
-	 *
-	 * 提交后慕享展示结算页，结构（实测确认）：
-	 *   .answer-panel-fl 下有多个 dl.question-list，每题一个 dl：
-	 *     dl > .question-num("第N题") + dt(题型+.question-title 题干) + div(选项+.right-answer+.解析)
-	 *   正确答案：<div class="right-answer">正确答案 :<span>A</span></div>
-	 *   多选题答案如 "A C D"（span 内空格分隔）。
-	 *
-	 * 题干用 titleTransform 标准化，保证与 answerer 缓存读取时的 title 完全一致
-	 * （searchAnswerInCaches 按 title 精确匹配）。
-	 */
-	const parseResultPageAnswers = (): { title: string; answer: string }[] => {
-		const dls = document.querySelectorAll('dl.question-list');
-		const results: { title: string; answer: string }[] = [];
-		dls.forEach((dl) => {
-			const titleEl = dl.querySelector<HTMLElement>('.question-title');
-			const answerEl = dl.querySelector('.right-answer span');
-			if (!titleEl || !answerEl) return;
-			// 标准化 title（与 answerer 一致）
-			const title = titleTransform([titleEl]);
-			// 答案：多选如 "A C D" → "ACD"，单选/判断如 "A"/"B"
-			const answer = (answerEl.textContent || '').replace(/\s+/g, '').trim();
-			if (title && answer) {
-				results.push({ title, answer });
-				console.log('[OCS-moycp] 结算页答案: ' + title.slice(0, 20) + '... => ' + answer);
-			}
-		});
-		return results;
-	};
-
-	/** 把结算页正确答案写入题库缓存（复用 addQuestionCacheFromWorkResult 的底层存储） */
-	const saveCorrectAnswersToCache = (answers: { title: string; answer: string }[]) => {
-		if (!answers.length) {
-			console.log('[OCS-moycp] 结算页未提取到答案，跳过缓存');
-			return;
-		}
-		// 转成 SimplifyWorkResult 格式，复用现有写入路径（去重、上限200、持久化）
-		const swr: SimplifyWorkResult[] = answers.map((a) => ({
-			question: a.title,
-			type: 'unknown' as any,
-			requested: true,
-			resolved: true,
-			searchInfos: [
-				{
-					name: '【题库缓存】闯关结算页记录',
-					homepage: '',
-					results: [[a.title, a.answer, { cache: true, ai: false }]]
-				}
-			]
-		}));
-		CommonProject.scripts.apps.methods.addQuestionCacheFromWorkResult(swr);
-		$msg_and_log('info', `已记录 ${answers.length} 题的正确答案到题库缓存`);
-	};
-
-	/** 检测结算页是否闯关失败（body 含"任务失败"） */
-	const isExamFailed = (): boolean => {
-		return document.body.innerText.includes('任务失败');
-	};
-
-	/** 重闯当前小节：用当前 type=exam URL 重新导航，触发 work 用缓存答案重答。
-	 * ⚠️ 重闯计数用 $store 持久化——retryCurrentExam 用 location.href 整页刷新，
-	 * 模块级 state 会重置，导致计数每次从 0 开始、上限永远到不了。
-	 * 用 $store（GM 持久存储）按 itemId 存计数，跨刷新保留。
-	 */
-	const getRetryKey = (itemId: string) => `moycp_exam_retry_${itemId}`;
-	const getRetryCount = (itemId: string) => parseInt($store.get(getRetryKey(itemId), '0') || '0', 10);
-	const setRetryCount = (itemId: string, n: number) => $store.set(getRetryKey(itemId), String(n));
-	const clearRetryCount = (itemId: string) => {
-		try {
-			$store.delete(getRetryKey(itemId));
-		} catch {
-			/* 某些环境 delete 不可用，忽略 */
-		}
-	};
-	const retryCurrentExam = () => {
-		const itemId = new URLSearchParams(location.search).get('itemId') || '';
-		const count = getRetryCount(itemId) + 1;
-		setRetryCount(itemId, count);
-		const MAX_RETRY = 2;
-		if (count > MAX_RETRY) {
-			$msg_and_log('warn', `闯关失败且重闯已达上限（${MAX_RETRY}次），跳过当前小节，请手动检查。`);
-			clearRetryCount(itemId);
-			return false;
-		}
-		$msg_and_log('info', `检测到闯关失败，使用记录的正确答案重闯当前小节（第 ${count} 次）`);
-		// 重新进入当前答题页（带随机延迟，模拟人工）
-		setTimeout(() => {
-			// 重新导航回答题页，dispatcher/oncomplete 会重新触发 work.main（防重入锁已释放）
-			location.href = location.pathname + location.search;
-		}, 800 + Math.floor(Math.random() * 1200));
-		return true;
-	};
-
-	/** 新建答题器 */
-	const worker = new OCSWorker({
-		/**
-		 * 慕享答题页为单题模式，root 指向当前题目容器。
-		 * .answer-panel-content 内每次渲染一题。
-		 */
-		root: '.answer-panel-content',
-		elements: {
-			/** 题干： .question-title 下的文本 */
-			title: '.question-title',
-			/**
-			 * 选项：每个 dd.answer-option > label 包含 input + p.answer-item
-			 * 选项 value 后缀序号被打乱（非 ABCD 顺序），必须按文本匹配答案
-			 */
-			options: 'dd.answer-option label'
-		},
-		thread: 1,
-		answerSeparators: answerSeparators.split(',').map((s) => s.trim()),
-		/** 默认搜题方法构造器 */
-		answerer: (elements, ctx) => {
-			const title = titleTransform(elements.title);
-			if (title) {
-				return CommonProject.scripts.apps.methods.searchAnswerInCaches(title, async () => {
-					// ⚠️ AI 多 key 顺序 fallback：defaultAnswerWrapperHandler 内部用
-					// Promise.all 并行调用所有 wrapper，不是"失败才切换"。
-					// 这里改为顺序遍历——第一个 AI 返回非空答案就用，失败/空才试下一个。
-					// 这样配置多个备用 AI 时，主 AI 不可用会自动切到备用。
-					const optionText = ctx.elements.options
-						.map((o) => optimizationElementWithImage(o, true).innerText)
-						.join('\n');
-					// 非 AI wrapper（如其他题库）保持并行调用
-					const nonAIWrappers = answererWrappers.filter(
-						(w) => !w.name.includes('AI大模型题库')
-					);
-					const aiWrappers = answererWrappers.filter((w) =>
-						w.name.includes('AI大模型题库')
-					);
-					// 先并行跑所有非 AI wrapper（题库类，无 key 限制）
-					const nonAIResults =
-						nonAIWrappers.length > 0
-							? await defaultAnswerWrapperHandler(nonAIWrappers, {
-									type: ctx.type || 'unknown',
-									title,
-									options: optionText
-							  })
-							: [];
-					// 如果非 AI wrapper 有答案，直接用
-					if (nonAIResults.some((r) => r.results && r.results.length > 0)) {
-						return nonAIResults;
-					}
-					// 顺序尝试每个 AI wrapper（主→备用），第一个有答案就用
-					for (let i = 0; i < aiWrappers.length; i++) {
-						const aw = aiWrappers[i];
-						try {
-							console.log('[OCS-moycp] 尝试 AI 题库:', aw.name, `(${i + 1}/${aiWrappers.length})`);
-							const results = await defaultAnswerWrapperHandler([aw], {
-								type: ctx.type || 'unknown',
-								title,
-								options: optionText
-							});
-							if (results.some((r) => r.results && r.results.length > 0)) {
-								console.log('[OCS-moycp] AI 题库命中:', aw.name);
-								return results;
-							}
-							console.log('[OCS-moycp] AI 题库无结果，切换下一个:', aw.name);
-						} catch (e) {
-							console.log('[OCS-moycp] AI 题库出错，切换下一个:', aw.name, e);
-						}
-					}
-					// 全部失败，返回非 AI 的结果（可能为空）
-					return nonAIResults;
-				});
-			} else {
-				throw new Error('题目为空，请查看题目是否为空，或者忽略此题');
-			}
-		},
-		/**
-		 * 自定义工作器（绕过 resolveMultiple 的 core bug）
-		 *
-		 * core 的 resolveMultiple 在选项含字母前缀（"A. xxx"）时有 indexOf 错位 bug，
-		 * 导致多选题全选/错选。这里自己实现匹配+选中逻辑：
-		 * 1. 从 searchInfos 汇总所有答案
-		 * 2. 按题型匹配选项（单选/多选/判断用文本包含 + 字母兜底，填空直接填）
-		 * 3. 点击匹配的 label 触发 Vue 选中
-		 */
-		work: async (ctx) => {
-			const options = ctx.elements.options;
-			const type = ctx.type;
-			// 诊断日志：确认 CustomWork 新代码生效
-			const dbgAnswers = ctx.searchInfos.map((i) => i.results.map((r) => r.answer)).flat().filter(Boolean);
-			console.log('[OCS-CustomWork] 题型=' + type + ' 选项数=' + options.length + ' AI答案=' + JSON.stringify(dbgAnswers));
-			// 汇总所有题库的答案
-			const answers = ctx.searchInfos
-				.map((info) => info.results.map((r) => r.answer))
-				.flat()
-				.filter(Boolean) as string[];
-			if (answers.length === 0) {
-				return { finish: false };
-			}
-
-			// 填空题：找输入框填入答案
-			if (type === 'completion') {
-				const answer = answers[0].trim();
-				// 模拟人工思考后再填写
-				await humanSleep(800, 1600);
-				for (const opt of options) {
-					const input = opt.querySelector('textarea, input[type=text]') as HTMLInputElement | null;
-					if (input && input.value.trim() !== answer) {
-						input.value = answer;
-						input.dispatchEvent(new Event('input', { bubbles: true }));
-						input.dispatchEvent(new Event('change', { bubbles: true }));
-						return { finish: true };
-					}
-				}
-				return { finish: false };
-			}
-
-			// 单选/多选/判断题：匹配选项并选中
-			// answers 可能是 "AC"、"A#C"、"思维能否#存在和思维"、"正确" 等
-			// 拆分所有答案为单个 token
-			const tokens = new Set<string>();
-			for (const ans of answers) {
-				// 按 # / 空格 / 逗号拆分
-				for (const part of ans.split(/[#\s,，、；;]+/).filter(Boolean)) {
-					tokens.add(part.trim());
-				}
-				// 纯字母答案（如 "AC"）拆成单个字母
-				if (/^[A-Da-d]{1,4}$/.test(ans.trim())) {
-					for (const ch of ans.trim()) tokens.add(ch.toUpperCase());
-				}
-			}
-
-				// ⚠️ 关键：先计算所有应选选项，再一次性同步点击。
-				// 慕享多选题（checkbox）选中任一选项后约 1.8 秒会自动跳到下一题；
-				// 若像旧代码那样"匹配一个就 await sleep(300) 再点下一个"，
-				// 后续选项的点击会落在跳转后的新题上 → 多选题永远选不够 → 不标 .already → 死循环。
-				// 解决：全部匹配计算完成后再批量同步点击（不 sleep），抢在慕享跳转前把所有选项一次性选完。
-				const toSelect: { opt: HTMLElement; optText: string }[] = [];
-				for (const opt of options) {
-					const input = opt.querySelector('input') as HTMLInputElement | null;
-					if (!input || input.checked) continue;
-					const optText = opt.innerText.replace(/\s+/g, '').trim();
-					let shouldSelect = false;
-
-					for (const token of tokens) {
-						const t = token.replace(/\s+/g, '');
-						// 1. 字母匹配：token 是 A/B/C/D，选项以 "A."/"A、"/"A)" 开头
-						if (/^[A-D]$/.test(t)) {
-							if (new RegExp('^' + t + '[.、)]').test(optText)) {
-								shouldSelect = true;
-								break;
-							}
-						}
-						// 2. 判断题：token 是 正确/错误，选项文本含正确/错误
-						if (t === '正确' || t === '对' || t === '是') {
-							if (optText.includes('正确') || optText.includes('对')) {
-								shouldSelect = true;
-								break;
-							}
-						}
-						if (t === '错误' || t === '错' || t === '否') {
-							if (optText.includes('错误') || optText.includes('错')) {
-								shouldSelect = true;
-								break;
-							}
-						}
-						// 3. 文本包含匹配（去掉字母前缀后比较）
-						const optNoPrefix = optText.replace(/^[A-D][.、)]/, '');
-						if (optNoPrefix.includes(t) || t.includes(optNoPrefix)) {
-							shouldSelect = true;
-							break;
-						}
-					}
-
-					if (shouldSelect) {
-						toSelect.push({ opt, optText });
-					}
-				}
-
-				// 逐个 label.click() 选中，每个之间加随机延迟模拟人工（150-350ms）。
-				//
-				// ⚠️ 实测对照（干净页面多次验证）的最终结论：
-				//   - label.click() 同步批量（无延迟）→ Vue 异步冲突，多选只选中1个，不标 .already ❌
-				//   - input.checked=true + change/input → 能改 DOM checked，但不触发慕享 Vue 的 click 逻辑，
-				//     慕享不标记 .already（isAnswered 判定失败）❌
-				//   - label.click() 逐个 + 随机延迟 → 触发慕享 Vue click handler（更新内部状态→标 .already）✅，
-				//     且间隔让 Vue 完成上一次更新，避免冲突。单选/多选/判断都有效。
-				// 所以正确做法 = label.click() 逐个调用 + 间隔随机延迟。
-				// 注意：总耗时须小于慕享选中后约 1.8s 的自动跳转窗口。
-				//   4 选项 × 平均 250ms ≈ 1s，安全在窗口内。
-				let matchedCount = 0;
-				for (const { opt, optText } of toSelect) {
-					if (matchedCount > 0) await humanSleep(150, 350);
-					const label = opt.closest('label') || opt.querySelector('label') || opt;
-					label.click();
-					matchedCount++;
-					console.log('[OCS-CustomWork] 选中: ' + optText.slice(0, 20));
-				}
-
-			console.log('[OCS-CustomWork] 完成匹配，共选中 ' + matchedCount + ' 个');
-			return { finish: matchedCount > 0 };
-		},
-		onElementSearched(elements) {
-			elements.options.forEach((el) => {
-				optimizationElementWithImage(el);
-			});
-		},
-		/** 完成答题后 */
-		onResultsUpdate(curr, _, res) {
-			CommonProject.scripts.workResults.methods.setResults(simplifyWorkResult(res, titleTransform));
-
-			if (curr.result?.finish) {
-				CommonProject.scripts.apps.methods.addQuestionCacheFromWorkResult(simplifyWorkResult([curr], titleTransform));
-			}
-			// ⚠️ 不调用 updateWorkStateByResults(res)：单题模式下 res.length 恒为 1，
-			//    会把 totalQuestionCount 覆盖成 1（导致 UI 显示 1/1）。
-			//    总题数和进度由答题循环里的 updateWorkState 手动维护（见下方循环）。
-		}
-	});
-
-	/**
-	 * 逐题答题循环
-	 *
-	 * 慕享为单题逐题模式，屏幕一次只显示一道题。
-	 * 流程：答当前题 → 等待 → 点下一题 → 等新题加载 → 循环，直到没有下一题。
-	 *
-	 * 关键点：
-	 * 1. 「下一题」按钮 .btn.next 在当前题未作答时会带 .noClick 类（点击无效）。
-	 *    常见于题库无答案、无法匹配选项的情况，此时通过答题卡跳转到下一题号。
-	 * 2. Vue 元素需用 .click() + MouseEvent 触发。
-	 */
-	/** 触发 Vue 元素的点击 */
-	const clickVue = (el: HTMLElement) => {
-		el.click();
-		el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-	};
-	/**
-	 * 判断答题是否应停止。
-	 * worker.isClose：重新答题/关闭时为 true（来自 'close' 事件）
-	 * worker.isStop：点「暂停」按钮时为 true（来自 'stop' 事件）
-	 * ⚠️ 必须同时检查两者——旧代码只检查 isClose，导致点暂停（isStop）后循环不停。
-	 */
-	const isStopped = () => worker.isClose || worker.isStop;
-	/** 通过答题卡跳转到指定题号 span（按 DOM 顺序，0 = 第1题）*/
-	const gotoQuestion = (index: number) => {
-		const span = document.querySelectorAll<HTMLElement>('.select-item-list span').item(index);
-		if (span) {
-			clickVue(span);
-			return true;
-		}
-		return false;
-	};
-
-	let lastQuestionTitle = '';
-	let sameTitleCount = 0;
-	let totalAnswered = 0;
-
-	/** 获取当前题号（从答题卡 .current 读取，0-based） */
-	const getCurrentIdx = () => {
-		const spans = document.querySelectorAll('.select-item-list span');
-		const cur = document.querySelector('.select-item-list span.current');
-		return cur ? Array.from(spans).indexOf(cur) : 0;
-	};
-	/** 获取总题数 */
-	const getTotalCount = () => document.querySelectorAll('.select-item-list span').length;
-	/** 判断指定题号是否已答（答题卡 span 含 .already 类）*/
-	const isAnswered = (idx: number) => {
-		const spans = document.querySelectorAll('.select-item-list span');
-		return !!spans[idx]?.classList.contains('already');
-	};
-	/** 获取所有未答题的 index 列表 */
-	const getUnansweredIndices = () => {
-		const spans = document.querySelectorAll('.select-item-list span');
-		const result: number[] = [];
-		spans.forEach((s, i) => {
-			if (!s.classList.contains('already')) result.push(i);
-		});
-		return result;
-	};
-	/**
-	 * 强制翻到指定题号，并等待 DOM 真正切换完成。
-	 * 慕享选中选项后会自动跳走，这里负责把它"拉回"到目标题。
-	 */
-	const forceGoto = async (targetIdx: number) => {
-		if (getCurrentIdx() === targetIdx) return;
-		gotoQuestion(targetIdx);
-		for (let w = 0; w < 5000; w += 300) {
-			await $.sleep(300);
-			if (getCurrentIdx() === targetIdx) break;
-		}
-		// 翻页后随机停顿，模拟人工阅读题目的节奏
-		await humanSleep(600, 1200);
-	};
-	/**
-	 * 答单道题：强制翻到 targetIdx → doWork → 等待并验证是否真正作答成功。
-	 * 返回是否作答成功（答题卡该题变为 already）。
-	 */
-	const answerOne = async (targetIdx: number): Promise<boolean> => {
-		await forceGoto(targetIdx);
-		if (isStopped()) return false;
-
-		const wasAnswered = isAnswered(targetIdx);
-		await worker.doWork({
-			enable_debug: BackgroundProject.scripts.dev.cfg.enable_answerer_debug
-		});
-
-		// 等待慕享标记为已答（选中后慕享异步更新 .already，最多等 4 秒）
-		for (let w = 0; w < 4000; w += 400) {
-			await $.sleep(400);
-			if (isAnswered(targetIdx)) break;
-		}
-
-		const nowAnswered = isAnswered(targetIdx);
-		// 如果之前未答现在也未答，说明没作答成功（如AI无答案）
-		if (!wasAnswered && !nowAnswered) {
-			$msg_and_log('warn', `第 ${targetIdx + 1} 题未作答成功（可能题库无答案）。`);
-		}
-		return nowAnswered;
-	};
-
-	(async () => {
-		/**
-		 * 慕享答题策略（强制顺序 + 循环补漏）：
-		 *
-		 * 1. 第一轮：按 0,1,2,...,N 顺序逐题作答
-		 * 2. 每轮结束后扫描未答题，如果有则再答一轮（最多 3 轮，防止死循环）
-		 * 3. 连续两轮未答题数无变化则停止（剩余的都是无答案的题）
-		 */
-		// 等答题卡渲染完成（进入答题页时 Vue 异步渲染，立即读会得到 1/0）
-		for (let w = 0; w < 10000; w += 500) {
-			await $.sleep(500);
-			if (getTotalCount() > 1) break;
-			if (isStopped()) return;
-		}
-		const total = getTotalCount();
-		// 更新 UI 题数（单题模式下 doWork 每次 results.length=1，必须手动用实际总题数，
-		// 否则 UI 永远显示 1/1）
-		CommonProject.scripts.workResults.methods.updateWorkState({
-			totalQuestionCount: total,
-			requestedCount: 0,
-			resolvedCount: 0
-		});
-		await $.sleep(1500);
-		$msg_and_log('info', `开始答题（共 ${total} 题，顺序遍历+补漏）。`);
-
-		const MAX_ROUNDS = 3;
-		let prevUnansweredCount = -1;
-
-		for (let round = 1; round <= MAX_ROUNDS; round++) {
-			if (isStopped()) break;
-
-			const unanswered = getUnansweredIndices();
-			if (unanswered.length === 0) {
-				$msg_and_log('info', `第 ${round - 1} 轮后，所有题目均已作答。`);
-				break;
-			}
-
-			// 连续两轮未答题数相同，说明剩余的都是无答案的题，停止
-			if (unanswered.length === prevUnansweredCount) {
-				$msg_and_log('warn', `连续两轮仍有 ${unanswered.length} 题未答，可能无答案，停止答题。未答题号：${unanswered.map((i) => i + 1).join(', ')}`);
-				break;
-			}
-			prevUnansweredCount = unanswered.length;
-
-			$msg_and_log('info', `第 ${round} 轮答题开始，待答 ${unanswered.length} 题：${unanswered.map((i) => i + 1).join(', ')}`);
-
-			for (const targetIdx of unanswered) {
-				if (isStopped()) break;
-				const ok = await answerOne(targetIdx);
-				totalAnswered++;
-				// 更新 UI 进度（已解决题数 = 当前已答数）
-				const answeredNow = getUnansweredIndices();
-				CommonProject.scripts.workResults.methods.updateWorkState({
-					totalQuestionCount: total,
-					requestedCount: total - answeredNow.length,
-					resolvedCount: total - answeredNow.length
-				});
-				// 答完一题后随机停顿，模拟人工节奏（等慕享自动跳转稳定）
-				await humanSleep(1000, 2000);
-			}
-		}
-
-		if (isStopped()) {
-			return;
-		}
-
-		$msg_and_log('info', `全部题目答题完成（共处理 ${totalAnswered} 次），等待 ${stopSecondWhenFinish} 秒后提交。`);
-		await $.sleep(stopSecondWhenFinish * 1000);
-		if (isStopped()) {
-			return;
-		}
-
-		// 处理提交
-		const results = await worker.doWork({ enable_debug: BackgroundProject.scripts.dev.cfg.enable_answerer_debug });
-		// 诊断日志：记录提交前的关键状态，定位"提示提交但没提交"的问题
-		{
-			const unansweredBefore = getUnansweredIndices();
-			const finishedCount = results.filter((r) => r.result?.finish).length;
-			console.log('[OCS-moycp] 提交前状态: upload配置=', upload,
-				'| doWork题数=', results.length,
-				'| finish题数=', finishedCount,
-				'| 计算完成率=', results.length === 0 ? 0 : (finishedCount / results.length) * 100,
-				'| 答题卡未答数=', unansweredBefore.length,
-				'| 答题卡总数=', getTotalCount());
-		}
-		await worker.uploadHandler({
-			type: upload,
-			results,
-			async callback(finishedRate, uploadable) {
-				// ⚠️ 关键：框架的 uploadable 基于 doWork 单题的 finish 状态算完成率，
-				// 但 moycp 是单题模式（results.length 恒为1），若提交前那道题没答上，
-				// uploadable=false 就不会提交——即使其他题都答了。
-				// 用答题卡的真实未答数覆盖判定：只要所有题都答了就提交。
-				const realUnanswered = getUnansweredIndices();
-				const realUploadable = uploadable || realUnanswered.length === 0;
-				console.log('[OCS-moycp] uploadHandler: 框架完成率=', finishedRate.toFixed(2),
-					'| 框架uploadable=', uploadable,
-					'| 答题卡未答=', realUnanswered.length,
-					'| 最终是否提交=', realUploadable);
-				const content = `完成率 ${finishedRate.toFixed(2)}% : ${realUploadable ? '3秒后将自动提交' : '3秒后将自动跳过'}`;
-				$console.info(content);
-				$msg_and_log('info', content);
-
-				await $.sleep(3000);
-				if (isStopped()) {
-					return;
-				}
-				if (realUploadable) {
-					CommonProject.scripts.render.methods.minimize();
-					CommonProject.scripts.render.methods.setPosition(100, 200);
-
-					// 找提交按钮，并处理 noClick（未答完被禁用）的情况。
-					// ⚠️ 实测：submit.click() 本身有效（能触发慕享提交），但按钮带 .noClick 时
-					// 点击无效。旧代码遇到 noClick 直接跳过 → 用户看到"3秒后自动提交"却没提交。
-					// 修复：noClick 时等待并重试（慕享异步更新答题状态），仍不行则明确报错。
-					let submitted = false;
-					for (let attempt = 0; attempt < 5; attempt++) {
-						const submit = document.querySelector<HTMLButtonElement>('button.submit');
-						if (!submit) {
-							$msg_and_log('warn', '未找到提交按钮，可能页面已变化。');
-							break;
-						}
-						if (submit.classList.contains('noClick')) {
-							// 慕享认为未答完，等一下重试（等异步状态更新）
-							console.log('[OCS-moycp] 提交按钮被禁用(noClick)，等待重试...', attempt + 1);
-							await humanSleep(800, 1500);
-							continue;
-						}
-						// 按钮可点，点击提交
-						submit.click();
-						submit.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-						submitted = true;
-						break;
-					}
-
-					if (!submitted) {
-						$msg_and_log('error', '提交失败：提交按钮被禁用或不存在（部分题目可能未答完）。请手动提交。');
-						return;
-					}
-
-					// 提交后等待结算页加载（结算页含 .right-answer 正确答案，Vue 异步渲染）
-					// ⚠️ 不能用固定 sleep——结算页渲染时间不定，太早解析会读空。
-					//    改为轮询等待 .right-answer 出现（最多 15 秒）。
-					let resultReady = false;
-					for (let w = 0; w < 15000; w += 500) {
-						await $.sleep(500);
-						if (document.querySelector('.right-answer')) {
-							resultReady = true;
-							break;
-						}
-						if (isStopped()) return;
-					}
-					if (!resultReady) {
-						console.warn('[OCS-moycp] 提交后 15 秒内未检测到结算页，跳过答案记录');
-					}
-					// 多等一会让所有题目渲染完
-					await humanSleep(1500, 2500);
-
-					// 1. 解析结算页正确答案并写入题库缓存
-					//    （下次重闯时 searchAnswerInCaches 命中，不再调 AI）
-					const correctAnswers = parseResultPageAnswers();
-					saveCorrectAnswersToCache(correctAnswers);
-
-					// 2. 检测是否闯关失败 → 失败则用缓存答案重闯当前小节
-					if (isExamFailed()) {
-						if (retryCurrentExam()) {
-							// 已发起重闯（重新导航回答题页），不再跳目录
-							return;
-						}
-						// 重闯达上限，继续往下跳目录
-					} else {
-						// 闯关成功，清除该小节的重闯计数
-						const successItemId = new URLSearchParams(location.search).get('itemId') || '';
-						if (successItemId) clearRetryCount(successItemId);
-						$msg_and_log('info', '闯关成功');
-					}
-
-					// 3. 成功 或 重闯达上限：返回课程目录页（由 course 脚本继续下一节）
-					// ⚠️ 不能用 history.back()——闯关入口是视频页 pushState 进来的，
-					// back 只会回到刚看过的视频页，又被 study 脚本接管重新进入答题。
-					// 直接导航到课程目录（用当前 courseId），由 course 脚本处理下一节。
-					const courseId = new URLSearchParams(location.search).get('courseId');
-					$msg_and_log('info', '答题已提交，返回课程目录继续下一节');
-					if (courseId) {
-						location.href = `/courseDetail/catalog?courseId=${courseId}`;
-					} else {
-						history.back();
-					}
-				}
-			}
-		});
-	})();
-
-	return worker;
-}
